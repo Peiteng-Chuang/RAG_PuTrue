@@ -220,10 +220,56 @@ class RAGSmartPipeline:
             v_doc.save(str(tmp_pdf)); v_doc.close()
             with torch.no_grad():
                 rendered = converter(str(tmp_pdf))
-                page_text, _, _ = text_from_rendered(rendered)
-            if page_text:
-                for banned_txt in self.banned_global_texts:
-                    if banned_txt in page_text: page_text = page_text.replace(banned_txt, "")
+                page_text, _, images = text_from_rendered(rendered)
+            if not page_text:
+                continue
+
+            for banned_txt in self.banned_global_texts:
+                if banned_txt in page_text:
+                    page_text = page_text.replace(banned_txt, "")
+
+            # === 1) 儲存 Marker 產出的圖片並改寫 md 引用 ===
+            # Marker 對單頁子 PDF 永遠回 `_page_0_*` 命名，跨頁會撞名 → 加 stem+page prefix。
+            if images:
+                for orig_name, img_obj in images.items():
+                    safe_name = f"{self.original_stem}_p{page_idx + 1}_{orig_name}"
+                    target = self.img_dir / safe_name
+                    try:
+                        if isinstance(img_obj, bytes):
+                            target.write_bytes(img_obj)
+                        elif hasattr(img_obj, "save"):
+                            img_obj.save(target)
+                        else:
+                            continue
+                    except Exception as e:
+                        print(f"⚠️ Marker 圖片儲存失敗 P{page_idx+1} {orig_name}: {e}")
+                        continue
+                    # 改寫所有指向 orig_name 的 ![...](orig_name) 為 ![safe](folder/safe)
+                    new_ref = f"![{safe_name}]({self.img_dir.name}/{safe_name})"
+                    page_text = re.sub(
+                        r"!\[[^\]]*\]\(" + re.escape(orig_name) + r"\)",
+                        lambda _m, ref=new_ref: ref,
+                        page_text,
+                    )
+
+            # === 2) 補抓 h3：fitz 沒給標題時，從 Marker 找 `## **xxx**` 或 `## xxx` ===
+            no_h3_marker = f"## 第 {page_idx + 1} 頁\n\n"
+            if no_h3_marker in self.md_fragments[page_idx]:
+                title_m = re.search(r"^##\s+\*\*(.+?)\*\*\s*$", page_text, re.MULTILINE)
+                if not title_m:
+                    title_m = re.search(r"^##\s+(.+?)\s*$", page_text, re.MULTILINE)
+                if title_m:
+                    title = title_m.group(1).strip().strip("*").strip()
+                    if 2 <= len(title) <= 80:
+                        self.md_fragments[page_idx] = self.md_fragments[page_idx].replace(
+                            no_h3_marker,
+                            f"## 第 {page_idx + 1} 頁\n### {title}\n\n",
+                            1,
+                        )
+                        # 把那行 ## 從 Marker 內容移掉避免雙標題
+                        page_text = page_text.replace(title_m.group(0), "", 1)
+                        page_text = re.sub(r"\n{3,}", "\n\n", page_text)
+
             anchor = f"[[MARKER_REPLACE_P{page_idx}]]"
             self.md_fragments[page_idx] = self.md_fragments[page_idx].replace(anchor, f"\n{page_text}\n")
         doc.close()
