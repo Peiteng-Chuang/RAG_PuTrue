@@ -1,5 +1,4 @@
-venv312/
-output/
+
 *.pdf
 .vscode/
 _compare_cache/
@@ -9,4 +8,6 @@ marker/
 mkdata/
 pdf_extractor_images
 qdrant_db/
+tmp/
+venv312/
 璞真RAG_rawdata/
