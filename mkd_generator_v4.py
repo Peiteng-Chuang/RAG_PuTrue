@@ -62,6 +62,21 @@ class RAGSmartPipeline:
                 buf = f.read(65536)
         return hasher.hexdigest()
 
+    @staticmethod
+    def _visible_image_xrefs_on_page(page, min_pt=5):
+        # 只認「實際 place 在頁面上」的 image xref，過濾僅列名於 resource dict 的圖。
+        # 因為 LibreOffice 從 PPT 轉 PDF 時會把 master 圖塞進每頁 resources，用
+        # get_images() 會把每張 master 圖當成「全頁都出現」，造成 banned_image_hashes 誤殺。
+        page_rect = page.rect
+        visible = set()
+        for info in page.get_image_info(xrefs=True):
+            x0, y0, x1, y1 = info["bbox"]
+            if (x1 - x0) <= min_pt or (y1 - y0) <= min_pt: continue
+            if x1 <= page_rect.x0 or x0 >= page_rect.x1: continue
+            if y1 <= page_rect.y0 or y0 >= page_rect.y1: continue
+            visible.add(info["xref"])
+        return visible
+
     def _pre_scan_for_templates(self, doc):
         total_pages = len(doc)
         if total_pages < 2: return
@@ -91,13 +106,15 @@ class RAGSmartPipeline:
                 curr_page_texts[norm_text] = curr_bbox
             prev_page_texts = curr_page_texts
 
-            for img in page.get_images(full=True):
-                xref = img[0]
+            seen_hashes_on_page = set()
+            for xref in self._visible_image_xrefs_on_page(page):
                 if xref not in self.xref_to_hash_cache:
                     img_data = doc.extract_image(xref)
                     h = hashlib.md5(img_data["image"]).hexdigest()
                     self.xref_to_hash_cache[xref] = h
                 h = self.xref_to_hash_cache[xref]
+                if h in seen_hashes_on_page: continue
+                seen_hashes_on_page.add(h)
                 image_occurrence[h] = image_occurrence.get(h, 0) + 1
 
         for h, count in image_occurrence.items():
@@ -186,8 +203,7 @@ class RAGSmartPipeline:
         return "\n".join(unique_texts)
 
     def _extract_fitz_images_dedup(self, page, page_idx, doc, page_content):
-        actual_images = page.get_image_info(xrefs=True)
-        visible_xrefs = {img['xref'] for img in actual_images if img['bbox'][2] - img['bbox'][0] > 5}
+        visible_xrefs = self._visible_image_xrefs_on_page(page)
         for img_info in page.get_images(full=True):
             try:
                 xref = img_info[0]
