@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Program Files/LibreOffice/program/**)",
+      "Read(//c/Program Files \\(x86\\)/LibreOffice/program/**)",
+      "Bash(where.exe soffice *)",
+      "Bash(where.exe soffice.exe)",
+      "Bash(C:/Program Files/LibreOffice/program/soffice.exe *)",
+      "PowerShell(Test-Path .\\\\venv312\\\\Scripts\\\\python.exe; .\\\\venv312\\\\Scripts\\\\python.exe --version)",
+      "PowerShell($env:PYTHONIOENCODING = \"utf-8\"; .\\\\venv312\\\\Scripts\\\\python.exe .\\\\simulate_v4_filters.py \"tmp\\\\libreoffice4win_out\\\\慶城福華銷講簡報\\(工務\\)1120425.pdf\")",
+      "PowerShell(.\\\\venv312\\\\Scripts\\\\python.exe -c \"import ast; ast.parse\\(open\\('mkd_generator_v4.py', encoding='utf-8'\\).read\\(\\)\\); print\\('mkd_generator_v4.py syntax OK'\\)\")",
+      "Bash(python -m py_compile md_review_ui.py)",
+      "Bash(python -c \"import numpy, fitz, streamlit; print\\('numpy', numpy.__version__\\); print\\('streamlit', streamlit.__version__\\)\")",
+      "Bash(python -c \"from FlagEmbedding import BGEM3FlagModel; print\\('FlagEmbedding available'\\)\")",
+      "Bash(venv312/Scripts/python.exe -c \"import numpy, fitz, streamlit; print\\('numpy', numpy.__version__\\); print\\('streamlit', streamlit.__version__\\); print\\('fitz', fitz.__version__\\)\")",
+      "Bash(venv312/Scripts/python.exe -c \"from FlagEmbedding import BGEM3FlagModel; print\\('FlagEmbedding available'\\)\")",
+      "Bash(venv312/Scripts/python.exe *)",
+      "Bash(ssh -V)",
+      "Bash(plink -pw 27112831 -batch cmpt@192.168.201.66 \"uname -a; echo '---DOCKER---'; docker --version 2>&1 || echo 'no docker'; echo '---DOCKER_PS---'; docker ps 2>&1 | head -5; echo '---DISK---'; df -h / 2>&1 | head -3; echo '---WHOAMI---'; whoami; id\")",
+      "Bash(docker --version)",
+      "Read(//c/Program Files/Docker/Docker/**)",
+      "Bash(start \"\" \"/c/Program Files/Docker/Docker/Docker Desktop.exe\")",
+      "Bash(docker version *)",
+      "Bash(docker run *)",
+      "Bash(curl -s http://localhost:6333/readyz)",
+      "Bash(curl -s http://localhost:6333/)",
+      "Bash(./venv312/Scripts/streamlit.exe run *)",
+      "Bash(./venv312/Scripts/python.exe *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
+    ]
+  }
+}

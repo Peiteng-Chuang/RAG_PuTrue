@@ -1,0 +1,2624 @@
+"""
+md_review_ui.py — PDF ↔ Markdown 即時比對 + 圖片管理 + 向量資料庫 chunk/metadata 預覽
+
+用法:
+    pip install streamlit
+    streamlit run md_review_ui.py
+
+依賴: streamlit, PyMuPDF (fitz)。PPT/PPTX 比對需要 LibreOffice。
+
+圖片刪除採「軟刪除＋垃圾桶」策略：
+- 刪除 = 從 md 移除引用 + 將檔案移至 ./_md_trash/{stem}/
+- 復原 = 從垃圾桶搬回 + 在原位置重新插入 md 引用
+"""
+import hashlib
+import json
+import platform
+import re
+import shutil
+import subprocess
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import NAMESPACE_DNS, uuid5
+
+import fitz
+import numpy as np
+import streamlit as st
+
+# 選用：VSCode 級編輯器（缺失時 fallback 至 st.text_area）
+try:
+    from streamlit_ace import st_ace
+    HAS_ACE = True
+except ImportError:
+    st_ace = None
+    HAS_ACE = False
+
+# Qdrant client（P3 上傳用；缺失時 Tab 5 會 disable）
+try:
+    from qdrant_client import QdrantClient
+    from qdrant_client.http import models as qm
+    HAS_QDRANT = True
+except ImportError:
+    QdrantClient = None
+    qm = None
+    HAS_QDRANT = False
+
+
+# === 路徑設定 ===
+DEFAULT_DATA_PATH = r"D:/璞真RAG資料夾/12.個案銷講資料"
+MKDATA_PATH = Path("./mkdata")
+TRACKER = MKDATA_PATH / "process_tracker.json"
+PDF_CACHE_DIR = Path("./_compare_cache")
+TRASH_DIR = Path("./_md_trash")
+PDF_CACHE_DIR.mkdir(exist_ok=True)
+TRASH_DIR.mkdir(exist_ok=True)
+
+
+# === 系統常數（對齊 qdrant格式.md v2.0.0） ===
+PIPELINE_VERSION = "2.0.0"
+EMBEDDING_MODEL = "BAAI/bge-m3"
+EMBEDDING_VERSION = "v1"
+EMBEDDING_DIM_DENSE = 1024
+SIDECAR_VERSION = "1.0"
+CHUNKING_STRATEGY = "heading+token-v1"
+REVIEW_STATUSES = ["unprocessed", "processing", "encoded", "ingested"]
+STATUS_BADGE = {
+    "unprocessed": {"emoji": "🔴", "label": "未處理",   "bg": "#fdecec", "fg": "#c0392b"},
+    "processing":  {"emoji": "🟡", "label": "處理中",   "bg": "#fff5d6", "fg": "#a86b00"},
+    "encoded":     {"emoji": "🟢", "label": "處理完",   "bg": "#e3f7e3", "fg": "#27713a"},
+    "ingested":    {"emoji": "🔵", "label": "已寫入庫", "bg": "#d6ecf7", "fg": "#1f5fa8"},
+}
+# 舊版 sidecar 欄位值的相容遷移
+LEGACY_STATUS_MIGRATION = {
+    "unreviewed":   "unprocessed",
+    "in_progress":  "processing",
+    "approved":     "ingested",
+    "needs_rework": "processing",
+    "done":         "ingested",   # 舊 3 態的 done 對齊新 4 態的 ingested
+}
+AVAILABLE_EMBEDDERS = ["BAAI/bge-m3"]  # 之後可加 Qwen3-Embedding-4B 等
+
+# === Qdrant 常數（對齊 qdrant格式.md §2）===
+QDRANT_TEXT_COLLECTION = "putrue_rag_text_v1"
+QDRANT_DEFAULT_URL = "http://localhost:6333"
+QDRANT_BATCH_SIZE = 100
+
+
+# === LibreOffice 偵測 ===
+import os
+
+LIBREOFFICE_CANDIDATES_WIN = [
+    r"C:\Program Files\LibreOffice\program\soffice.exe",
+    r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+    r"D:\Program Files\LibreOffice\program\soffice.exe",
+    r"D:\LibreOffice\program\soffice.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Programs\LibreOffice\program\soffice.exe"),
+]
+
+
+def find_soffice(override: str | None = None) -> str | None:
+    """回傳第一個可用的 LibreOffice 執行檔路徑；找不到回傳 None。"""
+    if override:
+        op = Path(override)
+        if op.exists():
+            return str(op)
+        return None
+    if platform.system() == "Windows":
+        for cand in LIBREOFFICE_CANDIDATES_WIN:
+            if cand and Path(cand).exists():
+                return cand
+        # PATH 兜底
+        for name in ("soffice.exe", "soffice"):
+            found = shutil.which(name)
+            if found:
+                return found
+        return None
+    found = shutil.which("libreoffice") or shutil.which("soffice")
+    return found
+
+
+def _lo_profile_uri() -> str:
+    """獨立使用者設定，避免與正在運行的 LO GUI 實例衝突。"""
+    profile = (PDF_CACHE_DIR / "_lo_profile").absolute()
+    profile.mkdir(parents=True, exist_ok=True)
+    return "file:///" + str(profile).replace("\\", "/")
+
+
+def ensure_pdf(source_path: Path, soffice_path: str | None = None) -> Path:
+    ext = source_path.suffix.lower()
+    if ext == ".pdf":
+        return source_path
+    if ext not in [".ppt", ".pptx"]:
+        raise ValueError(f"不支援的副檔名: {ext}")
+
+    cached = PDF_CACHE_DIR / f"{source_path.stem}.pdf"
+    if cached.exists() and cached.stat().st_size > 0:
+        return cached
+
+    if not soffice_path:
+        raise RuntimeError(
+            "找不到 LibreOffice。請至 https://www.libreoffice.org/download/ 安裝，"
+            "或在左側 sidebar『LibreOffice 路徑』手動指定 soffice.exe。"
+        )
+
+    cmd = [
+        soffice_path,
+        f"-env:UserInstallation={_lo_profile_uri()}",
+        "--headless", "--convert-to", "pdf",
+        "--outdir", str(PDF_CACHE_DIR),
+        str(source_path),
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=180,
+            encoding="utf-8", errors="replace",
+        )
+    except FileNotFoundError:
+        raise RuntimeError(f"LibreOffice 路徑無效：{soffice_path}")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("LibreOffice 轉檔逾時 (>180s)，可能有 LO 實例卡住。")
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"LibreOffice 轉檔失敗 (exit={result.returncode})\n"
+            f"stderr: {(result.stderr or '').strip()[:500]}\n"
+            f"stdout: {(result.stdout or '').strip()[:200]}"
+        )
+
+    if cached.exists() and cached.stat().st_size > 0:
+        return cached
+
+    # 寬鬆比對：LO 可能因為檔名特殊字元而輸出不同名字
+    siblings = sorted(
+        (p for p in PDF_CACHE_DIR.glob("*.pdf") if p.stat().st_size > 0),
+        key=lambda p: p.stat().st_mtime, reverse=True,
+    )
+    if siblings:
+        latest = siblings[0]
+        if latest != cached:
+            try:
+                latest.rename(cached)
+                return cached
+            except Exception:
+                return latest
+        return latest
+
+    raise RuntimeError(
+        f"LibreOffice 回報成功但找不到輸出 PDF。\n"
+        f"預期: {cached.name}\n"
+        f"stderr: {(result.stderr or '').strip()[:500]}"
+    )
+
+
+@st.cache_data
+def load_tracker():
+    with open(TRACKER, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def split_key_parts(file_key: str) -> list[str]:
+    return [p for p in re.split(r"[\\/]+", file_key) if p]
+
+
+def derive_md_path(file_key: str) -> Path:
+    file_name = split_key_parts(file_key)[-1]
+    stem = Path(file_name).stem
+    return MKDATA_PATH / f"{stem}.md"
+
+
+# === Sidecar 持久化（review 狀態 / 自訂標籤 / 刪除歷史） ===
+def derive_sidecar_path(file_key: str) -> Path:
+    file_name = split_key_parts(file_key)[-1]
+    stem = Path(file_name).stem
+    return MKDATA_PATH / f"{stem}.review.json"
+
+
+def compute_file_hash(source_path: Path) -> str:
+    """來源檔 MD5；找不到或讀不到回空字串。1MB 一塊串流避免大檔吃記憶體。"""
+    if not source_path.exists():
+        return ""
+    try:
+        h = hashlib.md5()
+        with open(source_path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
+def sidecar_default(file_key: str) -> dict:
+    return {
+        "version": SIDECAR_VERSION,
+        "file_key": file_key,
+        "file_hash": "",
+        "review_status": "unprocessed",
+        "reviewer": "",
+        "reviewed_at": None,
+        "custom_labels": {"document": [], "pages": {}},
+        "split_settings": {"mode": "delimiter", "delim": "\\n"},
+        "delete_history": [],
+    }
+
+
+def load_sidecar(file_key: str) -> dict:
+    """讀 sidecar；無檔或解析失敗回空白骨架（不寫盤）。"""
+    path = derive_sidecar_path(file_key)
+    if not path.exists():
+        return sidecar_default(file_key)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        st.warning(f"sidecar {path.name} 解析失敗，改用空白狀態：{e}")
+        return sidecar_default(file_key)
+    # 補欄位（前向相容）
+    defaults = sidecar_default(file_key)
+    for k, v in defaults.items():
+        data.setdefault(k, v)
+    # 舊版狀態值遷移
+    raw_status = data.get("review_status", "unprocessed")
+    if raw_status in LEGACY_STATUS_MIGRATION:
+        data["review_status"] = LEGACY_STATUS_MIGRATION[raw_status]
+    elif raw_status not in REVIEW_STATUSES:
+        data["review_status"] = "unprocessed"
+    return data
+
+
+def save_sidecar(file_key: str, sidecar: dict) -> None:
+    """原子寫入：tmp + rename。"""
+    path = derive_sidecar_path(file_key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(sidecar, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def get_file_status_quick(file_key: str) -> str:
+    """直接從 sidecar JSON 撈 review_status，不經 session_state、不污染。
+    sidebar 列表用：每 rerun 對所有檔案掃一次 disk。"""
+    sp = derive_sidecar_path(file_key)
+    if not sp.exists():
+        return "unprocessed"
+    try:
+        data = json.loads(sp.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return "unprocessed"
+    raw = data.get("review_status", "unprocessed")
+    raw = LEGACY_STATUS_MIGRATION.get(raw, raw)
+    return raw if raw in REVIEW_STATUSES else "unprocessed"
+
+
+def mark_processing(file_key: str) -> None:
+    """編輯動作觸發：unprocessed/encoded/ingested → processing。同時 persist sidecar。
+    已是 processing 則 no-op，避免多餘磁碟寫入。
+    從 encoded/ingested 進入時記下 prior_status，供 捨棄編輯 還原。"""
+    if not file_key:
+        return
+    sidecar = st.session_state.sidecars.get(file_key)
+    if sidecar is None:
+        return
+    if sidecar.get("review_status") == "processing":
+        persist_review_state(file_key)
+        return
+    prev = sidecar.get("review_status")
+    if prev in ("encoded", "ingested"):
+        sidecar["prior_status"] = prev
+        sidecar["disk_dirty"] = False
+    sidecar["review_status"] = "processing"
+    persist_review_state(file_key)
+
+
+def mark_encoded(file_key: str) -> None:
+    """Tab 4 全檔批次 encode 成功觸發：→ encoded（綠）。
+    代表本地向量已建好、reviewer 至少切到末頁；下一步應該 Tab 5 上傳。"""
+    if not file_key:
+        return
+    sidecar = st.session_state.sidecars.get(file_key)
+    if sidecar is None:
+        return
+    sidecar["review_status"] = "encoded"
+    sidecar.pop("prior_status", None)
+    sidecar.pop("disk_dirty", None)
+    persist_review_state(file_key)
+
+
+def mark_ingested(file_key: str) -> None:
+    """Tab 5 Qdrant 上傳成功觸發：→ ingested（淡藍），並蓋時間戳。
+    Qdrant 收下整檔 vectors + payload 後才會走到這。"""
+    if not file_key:
+        return
+    sidecar = st.session_state.sidecars.get(file_key)
+    if sidecar is None:
+        return
+    sidecar["review_status"] = "ingested"
+    sidecar["reviewed_at"] = now_iso()
+    sidecar.pop("prior_status", None)
+    sidecar.pop("disk_dirty", None)
+    persist_review_state(file_key)
+
+
+def persist_review_state(file_key: str) -> None:
+    """把目前 session_state 內的編輯狀態同步寫回 sidecar。"""
+    if not file_key:
+        return
+    sidecar = st.session_state.sidecars.get(file_key)
+    if sidecar is None:
+        return
+    labels = st.session_state.custom_labels.get(file_key, {"document": [], "pages": {}})
+    sidecar["custom_labels"] = {
+        "document": list(labels.get("document", [])),
+        # JSON key 必須是 str
+        "pages": {
+            str(k): list(v)
+            for k, v in labels.get("pages", {}).items()
+            if v
+        },
+    }
+    sidecar["split_settings"] = dict(
+        st.session_state.split_settings.get(
+            file_key, {"mode": "delimiter", "delim": "\\n"}
+        )
+    )
+    sidecar["delete_history"] = list(
+        st.session_state.delete_history.get(file_key, [])
+    )
+    save_sidecar(file_key, sidecar)
+
+
+# === Qdrant point id / section id ===
+def make_point_id(file_hash: str, page_num: int, section_idx: int, chunk_idx: int) -> str:
+    seed = f"{file_hash or 'NOHASH'}|{page_num}|{section_idx}|{chunk_idx}"
+    return str(uuid5(NAMESPACE_DNS, seed))
+
+
+def make_section_id(file_hash: str, page_num: int, section_idx: int) -> str:
+    seed = f"{file_hash or 'NOHASH'}|{page_num}|section|{section_idx}"
+    return str(uuid5(NAMESPACE_DNS, seed))
+
+
+def parse_md(md_text: str):
+    fm = {}
+    fm_match = re.search(r"^---\n(.*?)\n---\n", md_text, re.DOTALL | re.MULTILINE)
+    if fm_match:
+        for line in fm_match.group(1).splitlines():
+            kv = line.split(":", 1)
+            if len(kv) == 2:
+                fm[kv[0].strip()] = kv[1].strip().strip('"')
+
+    pattern = re.compile(r"^## 第 (\d+) 頁\n", re.MULTILINE)
+    matches = list(pattern.finditer(md_text))
+    if not matches:
+        return fm, md_text, []
+
+    pages = []
+    for i, m in enumerate(matches):
+        page_num = int(m.group(1))
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(md_text)
+        pages.append((page_num, md_text[start:end]))
+    header = md_text[: matches[0].start()]
+    return fm, header, pages
+
+
+@st.cache_data(max_entries=256, show_spinner=False)
+def _render_pdf_page_png_cached(pdf_path_str: str, mtime: float, page_idx: int, dpi: int) -> bytes:
+    doc = fitz.open(pdf_path_str)
+    try:
+        if page_idx < 0 or page_idx >= len(doc):
+            raise IndexError(f"頁碼超出範圍 (0-{len(doc)-1})")
+        mat = fitz.Matrix(dpi / 72, dpi / 72)
+        pix = doc[page_idx].get_pixmap(matrix=mat, alpha=False)
+        return pix.tobytes("png")
+    finally:
+        doc.close()
+
+
+def render_pdf_page_png(pdf_path: Path, page_idx: int, dpi: int = 110) -> bytes:
+    mtime = pdf_path.stat().st_mtime
+    return _render_pdf_page_png_cached(str(pdf_path), mtime, page_idx, dpi)
+
+
+def strip_page_header(page_md: str) -> str:
+    body = re.sub(r"^## 第 \d+ 頁\n", "", page_md)
+    body = re.sub(r"\n---\s*\n?$", "", body)
+    return body.strip()
+
+
+# === 圖片解析／編輯 ===
+# 規格：v4 一定每行一個 ![alt](path)，alt/path 可包含 ()，但不會跨行也不含 ]。
+# 用 greedy `.+` + 行尾錨點，確保路徑中的 () 不會把 match 切斷。
+IMG_REF_RE = re.compile(
+    r"!\[(?P<alt>[^\]\n]*)\]\((?P<path>.+)\)[ \t]*$",
+    re.MULTILINE,
+)
+
+
+def parse_images_in_page(page_md: str) -> list[dict]:
+    """回傳本頁所有 ![]() 的位置與內容。"""
+    return [
+        {
+            "alt": m.group("alt"),
+            "md_path": m.group("path"),
+            "match_start": m.start(),
+            "match_end": m.end(),
+            "full_match": m.group(0),
+        }
+        for m in IMG_REF_RE.finditer(page_md)
+    ]
+
+
+def image_folder_for(file_key: str, image_root: Path) -> Path:
+    """每個文件對應的 `{stem}_image` 資料夾。"""
+    stem = Path(split_key_parts(file_key)[-1]).stem
+    return image_root / f"{stem}_image"
+
+
+def resolve_image_path(file_key: str, md_path_in_md: str, image_root: Path) -> Path:
+    """
+    自動對應規則：
+        image_root / "{file_stem}_image" / basename(md_path_in_md)
+
+    只取 md 中 ![](...) 的檔名部分，忽略前綴目錄 — 圖片實際位置由
+    「圖片根目錄 + 檔名衍生子資料夾」決定。
+    """
+    basename = Path(md_path_in_md.replace("\\", "/")).name
+    return (image_folder_for(file_key, image_root) / basename).resolve()
+
+
+def remove_image_line(page_md: str, ref: dict) -> tuple[str, str, int]:
+    """從 page_md 移除整行（含換行）。回傳 (new_md, removed_line, line_start_offset)。"""
+    line_start = page_md.rfind("\n", 0, ref["match_start"]) + 1
+    line_end_idx = page_md.find("\n", ref["match_end"])
+    line_end = len(page_md) if line_end_idx == -1 else line_end_idx + 1
+    removed = page_md[line_start:line_end]
+    new_md = page_md[:line_start] + page_md[line_end:]
+    return new_md, removed, line_start
+
+
+def insert_at(page_md: str, text: str, offset: int) -> str:
+    offset = min(offset, len(page_md))
+    return page_md[:offset] + text + page_md[offset:]
+
+
+def is_ref_used_elsewhere(md_text: str, current_page_idx: int, img_md_path: str) -> bool:
+    _, _, all_pages = parse_md(md_text)
+    needle = re.compile(r"!\[[^\]]*\]\(" + re.escape(img_md_path) + r"\)")
+    for i, (_, p_md) in enumerate(all_pages):
+        if i == current_page_idx:
+            continue
+        if needle.search(p_md):
+            return True
+    return False
+
+
+def trash_subdir_for(file_key: str) -> Path:
+    stem = Path(split_key_parts(file_key)[-1]).stem
+    d = TRASH_DIR / stem
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def move_to_trash(abs_path: Path, file_key: str) -> Path:
+    sub = trash_subdir_for(file_key)
+    target = sub / abs_path.name
+    counter = 1
+    while target.exists():
+        target = sub / f"{abs_path.stem}__{counter}{abs_path.suffix}"
+        counter += 1
+    shutil.move(str(abs_path), str(target))
+    return target
+
+
+def restore_from_trash(trash_path: Path, original_path: Path):
+    original_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(trash_path), str(original_path))
+
+
+def replace_page(md_text: str, page_idx: int, new_page_md: str) -> str:
+    fm, header, pages = parse_md(md_text)
+    if page_idx >= len(pages):
+        return md_text
+    if not new_page_md.endswith("\n"):
+        new_page_md += "\n"
+    new_pages = [(p[0], new_page_md) if i == page_idx else p for i, p in enumerate(pages)]
+    return header + "".join(p[1] for p in new_pages)
+
+
+# === Heading 與切分 ===
+# `(?!#)` 防止把 `##`、`####` 也吃進來；`\s*` 容許 `###foo` 這種無空格寫法
+H1_RE = re.compile(r"^#(?!#)\s*(.+?)\s*$", re.MULTILINE)
+# h3-h6 通用 regex：捕捉 `#` 數量決定階級。h1/h2 由文件結構固定，不參與 section 切分。
+HEADING_RE = re.compile(r"^(#{3,6})(?!#)\s*(.+?)\s*$", re.MULTILINE)
+
+
+def extract_h1(md_text: str, fallback: str) -> str:
+    """整份 md 第一個 `# ...`，找不到回 fallback。"""
+    m = H1_RE.search(md_text)
+    return m.group(1).strip() if m else fallback
+
+
+def strip_image_refs(text: str) -> str:
+    """
+    移除 markdown 圖片引用，避免進入 chunk 文字（路徑字串對向量檢索無幫助；
+    圖片資訊已透過 metadata.image_paths 保留）。
+    - 整行就是 ![]() → 連同換行去掉
+    - 行內 inline ![]() → 只去引用本身
+    - 連續空行壓回 1 個
+    """
+    line_only = re.compile(
+        r"^[ \t]*!\[[^\]\n]*\]\(.+\)[ \t]*\n?",
+        re.MULTILINE,
+    )
+    cleaned = line_only.sub("", text)
+    cleaned = IMG_REF_RE.sub("", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned
+
+
+def derive_image_label_key(headings: dict[int, str], section_body: str) -> str:
+    """
+    決定該 section 圖片標籤的 key：
+    1. 有 heading（h3+）→ 用最深一階的標題
+    2. 完全無 heading，但 body 內僅有「唯一一條非標題且非空白」的文字 → 用該文字
+    3. 其餘情況 → 'image'
+    """
+    if headings:
+        deepest = max(headings.keys())
+        return headings[deepest]
+    candidates = [
+        ln.strip() for ln in section_body.splitlines()
+        if ln.strip() and not ln.lstrip().startswith("#")
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    return "image"
+
+
+def split_page_by_headings(page_md: str) -> list[dict]:
+    """
+    把一頁切成 sections，支援 h3-h6 任意層級巢狀。
+    回傳 list[{
+        'headings': dict[int, str],  # {3: "...", 4: "...", ...} 從最淺到最深
+        'body':     str,             # 已 strip 圖片引用 + trim
+        'image_paths': list[str],    # 該 section 內所有 ![]() 路徑
+    }]。
+
+    巢狀規則：遇到 level=L 的標題時，清掉 current 中所有 level >= L 的舊條目，
+    再寫入 current[L] = title。這代表新標題會取代同層或更深層的歷史脈絡。
+    第一個標題之前的內容歸到 headings={} 的 section（若有 body 或圖片才出現）。
+    """
+    body = re.sub(r"^## 第 \d+ 頁\s*\n", "", page_md)
+    body = re.sub(r"\n---\s*\n?$", "", body)
+
+    def make_section(headings: dict[int, str], raw: str) -> dict:
+        imgs = [r["md_path"] for r in parse_images_in_page(raw)]
+        cleaned = strip_image_refs(raw).strip()
+        return {"headings": dict(headings), "body": cleaned, "image_paths": imgs}
+
+    matches = list(HEADING_RE.finditer(body))
+    sections: list[dict] = []
+    current: dict[int, str] = {}
+
+    if not matches:
+        sec = make_section(current, body)
+        if sec["body"] or sec["image_paths"]:
+            sections.append(sec)
+        return sections
+
+    pre_sec = make_section(current, body[: matches[0].start()])
+    if pre_sec["body"] or pre_sec["image_paths"]:
+        sections.append(pre_sec)
+
+    for i, m in enumerate(matches):
+        level = len(m.group(1))
+        title = m.group(2).strip()
+        for lvl in [k for k in current.keys() if k >= level]:
+            del current[lvl]
+        current[level] = title
+
+        nl = body.find("\n", m.end())
+        sec_start = nl + 1 if nl != -1 else len(body)
+        sec_end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
+        sections.append(make_section(current, body[sec_start:sec_end]))
+
+    return sections
+
+
+def decode_delim(s: str) -> str:
+    """支援 \\n、\\t 等 escape sequence 輸入。"""
+    if not s:
+        return ""
+    try:
+        return s.encode("utf-8").decode("unicode_escape")
+    except UnicodeDecodeError:
+        return s
+
+
+def split_content(content: str, mode: str, delimiter: str) -> list[str]:
+    """mode = 'page' (整頁一塊) | 'delimiter' (依分隔字元)。"""
+    if not content.strip():
+        return []
+    if mode == "page":
+        return [content.strip()]
+    delim = decode_delim(delimiter)
+    if not delim:
+        return [content.strip()]
+    return [seg.strip() for seg in content.split(delim) if seg.strip()]
+
+
+def build_text_with_prefix(
+    project_name: str, file_stem: str, page_num: int,
+    headings: dict[int, str], seg_text: str,
+) -> str:
+    """產生注入 prefix 後的 chunk 文字（embedding 用）。
+    格式：[project | file_stem | P{page} | h3 > h4 > ...] {seg_text}"""
+    parts = [project_name, file_stem, f"P{page_num}"]
+    if headings:
+        heading_path = " > ".join(headings[lvl] for lvl in sorted(headings))
+        parts.append(heading_path)
+    return f"[{' | '.join(parts)}] {seg_text}"
+
+
+def build_image_struct(md_path: str, file_key: str, image_root: Path) -> dict:
+    """從 md 中 ![alt](path) 的 path 解析出 Qdrant payload 圖片結構。"""
+    basename = Path(md_path.replace("\\", "/")).name
+    abs_img = resolve_image_path(file_key, md_path, image_root)
+    return {
+        "file_name": basename,
+        "local_path": str(abs_img),
+        "md_ref": f"![{basename}]({md_path})",
+        "alt_text": basename,
+    }
+
+
+def build_chunk_payload(
+    *,
+    file_key: str,
+    sidecar: dict,
+    page_num: int,
+    section_idx: int,
+    section: dict,
+    seg_text: str,
+    chunk_idx: int,
+    chunk_idx_global: int,
+    h1: str,
+    doc_labels: list,
+    page_labels: list,
+    image_root: Path,
+    prev_chunk_id: str | None,
+    next_chunk_id: str | None,
+) -> dict:
+    """產出 qdrant格式.md v2.0.0 完整 payload（含 point id）。
+    single source of truth：UI 預覽、JSON 下載、Qdrant upsert 全部用同一個輸出。"""
+    parts = split_key_parts(file_key)
+    project_name = parts[0] if len(parts) > 1 else "未分類"
+    file_name = parts[-1]
+    file_stem = Path(file_name).stem
+    file_hash = sidecar.get("file_hash", "")
+    headings = section.get("headings", {})
+    image_paths = section.get("image_paths", [])
+
+    point_id = make_point_id(file_hash, page_num, section_idx, chunk_idx)
+    parent_section_id = make_section_id(file_hash, page_num, section_idx)
+    text_with_prefix = build_text_with_prefix(
+        project_name, file_stem, page_num, headings, seg_text
+    )
+    img_label = (
+        derive_image_label_key(headings, section.get("body", ""))
+        if image_paths else ""
+    )
+    images_struct = [build_image_struct(p, file_key, image_root) for p in image_paths]
+    headings_sorted = sorted(headings.keys())
+    label_keys = sorted(
+        {lab["key"] for lab in doc_labels} | {lab["key"] for lab in page_labels}
+    )
+    breadcrumb = [h1, f"第 {page_num} 頁"] + [headings[lvl] for lvl in headings_sorted]
+    current_header = headings[headings_sorted[-1]] if headings_sorted else f"第 {page_num} 頁"
+
+    return {
+        "id": point_id,
+        "payload": {
+            "metadata": {
+                "source": {
+                    "project_name": project_name,
+                    "file_key": file_key,
+                    "file_name": file_name,
+                    "file_path": file_key,
+                    "file_hash": file_hash,
+                    "doc_title": h1,
+                },
+                "location": {
+                    "page": page_num,
+                    "page_label": f"第 {page_num} 頁",
+                    "headings": {str(k): v for k, v in headings.items()},
+                    "headings_flat": [headings[lvl] for lvl in headings_sorted],
+                    "breadcrumb": breadcrumb,
+                    "current_header": current_header,
+                    "section_idx": section_idx,
+                    "chunk_idx": chunk_idx,
+                    "chunk_idx_global": chunk_idx_global,
+                },
+            },
+            "content": {
+                "text": seg_text,
+                "text_with_prefix": text_with_prefix,
+                "md_content": seg_text,
+                "token_count": len(seg_text),
+                "char_count": len(seg_text),
+            },
+            "visuals": {
+                "has_image": bool(image_paths),
+                "image_label": img_label,
+                "image_count": len(image_paths),
+                "images": images_struct,
+            },
+            "labels": {
+                "document": list(doc_labels),
+                "page": list(page_labels),
+                "label_keys": label_keys,
+            },
+            "chunking": {
+                "strategy": CHUNKING_STRATEGY,
+                "parent_section_id": parent_section_id,
+                "prev_chunk_id": prev_chunk_id,
+                "next_chunk_id": next_chunk_id,
+            },
+            "sys_info": {
+                "ingestion_time": None,
+                "pipeline_version": PIPELINE_VERSION,
+                "embedding_model": EMBEDDING_MODEL,
+                "embedding_version": EMBEDDING_VERSION,
+                "review_status": sidecar.get("review_status", "unreviewed"),
+                "reviewer": sidecar.get("reviewer", ""),
+                "reviewed_at": sidecar.get("reviewed_at"),
+            },
+        },
+    }
+
+
+def build_all_chunks_for_doc(
+    *,
+    file_key: str,
+    sidecar: dict,
+    pages: list[tuple[int, str]],
+    page_md_override: dict[int, str] | None,
+    h1: str,
+    doc_labels: list,
+    file_labels: dict,
+    split_cfg: dict,
+    image_root: Path,
+) -> list[dict]:
+    """走訪所有頁面 → sections → chunks，回傳全部 chunk payloads（含 prev/next 連結）。
+    每筆額外帶 _page_pos（page index in pages list）供 UI 篩選用，
+    寫入 Qdrant 前需 pop 掉這個底線開頭欄位。"""
+    file_hash = sidecar.get("file_hash", "")
+
+    flat: list[dict] = []
+    for page_pos, (page_num, page_md_default) in enumerate(pages):
+        page_md_eff = (page_md_override or {}).get(page_pos, page_md_default)
+        page_labels = file_labels["pages"].get(page_pos, [])
+        sections = split_page_by_headings(page_md_eff)
+        for section_idx, section in enumerate(sections):
+            if not section.get("body"):
+                continue
+            seg_list = split_content(
+                section["body"], split_cfg["mode"], split_cfg["delim"]
+            )
+            for chunk_idx, seg in enumerate(seg_list):
+                flat.append({
+                    "page_pos": page_pos,
+                    "page_num": page_num,
+                    "section_idx": section_idx,
+                    "section": section,
+                    "chunk_idx": chunk_idx,
+                    "seg": seg,
+                    "page_labels": page_labels,
+                })
+
+    point_ids = [
+        make_point_id(file_hash, it["page_num"], it["section_idx"], it["chunk_idx"])
+        for it in flat
+    ]
+
+    out: list[dict] = []
+    for i, it in enumerate(flat):
+        prev_id = point_ids[i - 1] if i > 0 else None
+        next_id = point_ids[i + 1] if i + 1 < len(point_ids) else None
+        pkg = build_chunk_payload(
+            file_key=file_key,
+            sidecar=sidecar,
+            page_num=it["page_num"],
+            section_idx=it["section_idx"],
+            section=it["section"],
+            seg_text=it["seg"],
+            chunk_idx=it["chunk_idx"],
+            chunk_idx_global=i,
+            h1=h1,
+            doc_labels=doc_labels,
+            page_labels=it["page_labels"],
+            image_root=image_root,
+            prev_chunk_id=prev_id,
+            next_chunk_id=next_id,
+        )
+        pkg["_page_pos"] = it["page_pos"]
+        out.append(pkg)
+    return out
+
+
+# === Embedding 快取（mkdata/{stem}.vectors.* 三件套）===
+def derive_vector_paths(file_key: str) -> dict:
+    file_name = split_key_parts(file_key)[-1]
+    stem = Path(file_name).stem
+    return {
+        "dense":    MKDATA_PATH / f"{stem}.vectors.dense.npy",
+        "sparse":   MKDATA_PATH / f"{stem}.vectors.sparse.json",
+        "manifest": MKDATA_PATH / f"{stem}.vectors.manifest.json",
+    }
+
+
+def load_vector_manifest(file_key: str) -> dict | None:
+    p = derive_vector_paths(file_key)["manifest"]
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def vector_cache_status(
+    file_key: str, sidecar: dict, expected_chunk_ids: list[str]
+) -> dict:
+    """判斷快取狀態。回 {exists, valid, reason, manifest?}."""
+    manifest = load_vector_manifest(file_key)
+    paths = derive_vector_paths(file_key)
+    if (
+        manifest is None
+        or not paths["dense"].exists()
+        or not paths["sparse"].exists()
+    ):
+        return {"exists": False, "valid": False, "reason": "無快取"}
+
+    reasons = []
+    if manifest.get("file_hash") != sidecar.get("file_hash"):
+        reasons.append("file_hash 變動")
+    if manifest.get("chunking_strategy") != CHUNKING_STRATEGY:
+        reasons.append("chunking_strategy 變動")
+    if manifest.get("embedding_model") != EMBEDDING_MODEL:
+        reasons.append("embedding_model 變動")
+    if manifest.get("embedding_version") != EMBEDDING_VERSION:
+        reasons.append("embedding_version 變動")
+    if manifest.get("chunk_ids") != expected_chunk_ids:
+        reasons.append("chunks 結構變動")
+
+    if reasons:
+        return {
+            "exists": True,
+            "valid": False,
+            "reason": "、".join(reasons),
+            "manifest": manifest,
+        }
+    return {"exists": True, "valid": True, "reason": "", "manifest": manifest}
+
+
+def save_vectors(
+    file_key: str, sidecar: dict,
+    chunk_ids: list[str], dense: np.ndarray, sparse: list[dict],
+    fp16: bool,
+) -> None:
+    """原子寫入：dense.npy + sparse.json + manifest.json。"""
+    paths = derive_vector_paths(file_key)
+    paths["dense"].parent.mkdir(parents=True, exist_ok=True)
+
+    # dense 存 fp16 省一半磁碟（檢索時轉 fp32）；非 fp16 流程仍存 fp32
+    arr = dense.astype(np.float16 if fp16 else np.float32)
+    tmp_dense = paths["dense"].with_suffix(".npy.tmp")
+    # 用 file object 餵 np.save，避免 numpy 對非 .npy 結尾的路徑自動補 .npy
+    # （否則會寫到 xxx.npy.tmp.npy，後續 replace 找不到 tmp 檔）
+    with open(tmp_dense, "wb") as f:
+        np.save(f, arr)
+    tmp_dense.replace(paths["dense"])
+
+    tmp_sparse = paths["sparse"].with_suffix(".json.tmp")
+    tmp_sparse.write_text(json.dumps(sparse, ensure_ascii=False), encoding="utf-8")
+    tmp_sparse.replace(paths["sparse"])
+
+    manifest = {
+        "file_key": file_key,
+        "file_hash": sidecar.get("file_hash", ""),
+        "chunking_strategy": CHUNKING_STRATEGY,
+        "embedding_model": EMBEDDING_MODEL,
+        "embedding_version": EMBEDDING_VERSION,
+        "dense_dim": int(dense.shape[1]),
+        "dense_dtype": str(arr.dtype),
+        "count": len(chunk_ids),
+        "chunk_ids": list(chunk_ids),
+        "encoded_at": now_iso(),
+        "fp16": fp16,
+    }
+    tmp_manifest = paths["manifest"].with_suffix(".json.tmp")
+    tmp_manifest.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    tmp_manifest.replace(paths["manifest"])
+
+
+def clear_vector_cache(file_key: str) -> int:
+    """刪除三件套；回傳實際刪掉的檔數。"""
+    n = 0
+    for p in derive_vector_paths(file_key).values():
+        if p.exists():
+            p.unlink()
+            n += 1
+    return n
+
+
+@st.cache_resource(show_spinner="載入 bge-m3 中（首次需 ~15s）...")
+def load_embedder(model_name: str, use_fp16: bool):
+    """快取整個 BGEM3FlagModel 物件，避免每次 rerun 重載。"""
+    try:
+        from FlagEmbedding import BGEM3FlagModel
+    except ImportError as e:
+        raise RuntimeError(
+            "FlagEmbedding 未安裝。請執行：\n"
+            "    pip install -U FlagEmbedding\n"
+            "（依賴 peft / accelerate，第一次裝約 100MB）"
+        ) from e
+    return BGEM3FlagModel(model_name, use_fp16=use_fp16)
+
+
+def encode_chunks(
+    model, texts: list[str], batch_size: int = 32,
+) -> tuple[np.ndarray, list[dict]]:
+    """bge-m3 一次推理同時拿 dense + sparse。
+    回 (dense: ndarray (N, 1024), sparse: list[dict[token_id_str → weight]])。"""
+    out = model.encode(
+        texts,
+        batch_size=batch_size,
+        return_dense=True,
+        return_sparse=True,
+        return_colbert_vecs=False,
+    )
+    dense = np.asarray(out["dense_vecs"], dtype=np.float32)
+    sparse = [
+        {str(k): float(v) for k, v in row.items()}
+        for row in out["lexical_weights"]
+    ]
+    return dense, sparse
+
+
+# === Qdrant 寫入 helpers ===
+@st.cache_resource(show_spinner="連線 Qdrant...")
+def get_qdrant_client(url: str, api_key: str):
+    """Cached client；URL / API key 改變會自動建新 cache entry。"""
+    if not HAS_QDRANT:
+        raise RuntimeError("qdrant-client 未安裝：pip install qdrant-client")
+    return QdrantClient(
+        url=url,
+        api_key=api_key or None,
+        timeout=30,
+    )
+
+
+PAYLOAD_INDEX_FIELDS = [
+    # (field path, schema type) — 對齊 qdrant格式.md §2.2
+    ("metadata.source.project_name", "keyword"),
+    ("metadata.source.file_hash",    "keyword"),
+    ("metadata.source.file_key",     "keyword"),
+    ("metadata.location.page",       "integer"),
+    ("metadata.location.headings_flat", "keyword"),
+    ("chunking.strategy",            "keyword"),
+    ("visuals.has_image",            "bool"),
+    ("visuals.image_label",          "keyword"),
+    ("labels.label_keys",            "keyword"),
+    ("sys_info.review_status",       "keyword"),
+    ("sys_info.embedding_model",     "keyword"),
+]
+
+
+def ensure_text_collection(client, name: str, recreate: bool = False) -> dict:
+    """確保 collection 存在；recreate=True 會先刪除再建。
+    回 {created: bool, recreated: bool, indexed: list[str]}。"""
+    info = {"created": False, "recreated": False, "indexed": []}
+    if recreate and client.collection_exists(name):
+        client.delete_collection(name)
+        info["recreated"] = True
+    if not client.collection_exists(name):
+        client.create_collection(
+            collection_name=name,
+            vectors_config={
+                "text_dense": qm.VectorParams(
+                    size=EMBEDDING_DIM_DENSE,
+                    distance=qm.Distance.COSINE,
+                ),
+            },
+            sparse_vectors_config={
+                "text_sparse": qm.SparseVectorParams(),
+            },
+        )
+        info["created"] = True
+        # 建 payload indexes（容錯：個別失敗不擋整體流程）
+        schema_map = {
+            "keyword": qm.PayloadSchemaType.KEYWORD,
+            "integer": qm.PayloadSchemaType.INTEGER,
+            "bool":    qm.PayloadSchemaType.BOOL,
+        }
+        for field, kind in PAYLOAD_INDEX_FIELDS:
+            try:
+                client.create_payload_index(
+                    collection_name=name,
+                    field_name=field,
+                    field_schema=schema_map[kind],
+                )
+                info["indexed"].append(field)
+            except Exception:
+                pass
+    return info
+
+
+def count_existing_for_file(client, name: str, file_hash: str) -> int:
+    """查 collection 內 file_hash 對應的 points 數。"""
+    if not file_hash:
+        return 0
+    if not client.collection_exists(name):
+        return 0
+    try:
+        res = client.count(
+            collection_name=name,
+            count_filter=qm.Filter(must=[
+                qm.FieldCondition(
+                    key="metadata.source.file_hash",
+                    match=qm.MatchValue(value=file_hash),
+                ),
+            ]),
+            exact=True,
+        )
+        return int(res.count)
+    except Exception:
+        return 0
+
+
+def get_collection_total(client, name: str) -> int:
+    try:
+        if not client.collection_exists(name):
+            return 0
+        return int(client.count(collection_name=name, exact=True).count)
+    except Exception:
+        return 0
+
+
+def load_cached_vectors(file_key: str) -> tuple[np.ndarray, list[dict], dict]:
+    """讀 mkdata/{stem}.vectors.* 三件套；dense 自動還原為 fp32。"""
+    paths = derive_vector_paths(file_key)
+    manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+    dense = np.load(paths["dense"])
+    if dense.dtype != np.float32:
+        dense = dense.astype(np.float32)
+    sparse = json.loads(paths["sparse"].read_text(encoding="utf-8"))
+    return dense, sparse, manifest
+
+
+def build_points_for_upsert(
+    chunk_payloads: list[dict],
+    dense: np.ndarray,
+    sparse: list[dict],
+    ingestion_ts: str,
+) -> list:
+    """組裝 PointStruct list；對齊 cache 順序，注入 ingestion_time。"""
+    points = []
+    for i, pkg in enumerate(chunk_payloads):
+        payload = pkg["payload"]
+        payload["sys_info"]["ingestion_time"] = ingestion_ts
+        sparse_dict = sparse[i] if i < len(sparse) else {}
+        if sparse_dict:
+            indices = [int(k) for k in sparse_dict.keys()]
+            values = [float(v) for v in sparse_dict.values()]
+        else:
+            indices, values = [], []
+        points.append(qm.PointStruct(
+            id=pkg["id"],
+            vector={
+                "text_dense": dense[i].tolist(),
+                "text_sparse": qm.SparseVector(indices=indices, values=values),
+            },
+            payload=payload,
+        ))
+    return points
+
+
+def upsert_in_batches(
+    client, name: str, points: list, batch_size: int = QDRANT_BATCH_SIZE,
+    progress_cb=None,
+) -> None:
+    """分批 upsert；wait=True 確保每批寫完才回來，失敗會 raise。"""
+    total = len(points)
+    for start in range(0, total, batch_size):
+        batch = points[start:start + batch_size]
+        client.upsert(collection_name=name, points=batch, wait=True)
+        if progress_cb:
+            progress_cb(min(start + len(batch), total), total)
+
+
+# === Qdrant 檢索 helpers（P5 檢索測試 Tab 用） ===
+
+def encode_query(model, query_text: str) -> tuple[np.ndarray, dict]:
+    """bge-m3 對單條 query 拿 dense + sparse。
+    不套 build_text_with_prefix —— bge-m3 是 symmetric encoder，
+    query 跟 passage 走同一個 encoder、不需要不同前綴。"""
+    out = model.encode(
+        [query_text],
+        return_dense=True,
+        return_sparse=True,
+        return_colbert_vecs=False,
+    )
+    dense = np.asarray(out["dense_vecs"], dtype=np.float32)[0]
+    sparse_raw = out["lexical_weights"][0]
+    sparse = {str(k): float(v) for k, v in sparse_raw.items()}
+    return dense, sparse
+
+
+def _sparse_to_qdrant(sparse: dict) -> "qm.SparseVector":
+    if not sparse:
+        return qm.SparseVector(indices=[], values=[])
+    indices = [int(k) for k in sparse.keys()]
+    values = [float(v) for v in sparse.values()]
+    return qm.SparseVector(indices=indices, values=values)
+
+
+def search_dense(
+    client, name: str, dense: np.ndarray, top_k: int,
+    qfilter: "qm.Filter | None" = None,
+) -> list:
+    res = client.query_points(
+        collection_name=name,
+        query=dense.tolist(),
+        using="text_dense",
+        limit=top_k,
+        with_payload=True,
+        query_filter=qfilter,
+    )
+    return res.points
+
+
+def search_sparse(
+    client, name: str, sparse: dict, top_k: int,
+    qfilter: "qm.Filter | None" = None,
+) -> list:
+    res = client.query_points(
+        collection_name=name,
+        query=_sparse_to_qdrant(sparse),
+        using="text_sparse",
+        limit=top_k,
+        with_payload=True,
+        query_filter=qfilter,
+    )
+    return res.points
+
+
+def search_hybrid(
+    client, name: str, dense: np.ndarray, sparse: dict, top_k: int,
+    qfilter: "qm.Filter | None" = None,
+    prefetch_k: int = 40,
+) -> list:
+    """RRF 融合：dense + sparse 各撈 prefetch_k，伺服器端做 Reciprocal Rank Fusion。"""
+    res = client.query_points(
+        collection_name=name,
+        prefetch=[
+            qm.Prefetch(
+                query=dense.tolist(),
+                using="text_dense",
+                limit=prefetch_k,
+                filter=qfilter,
+            ),
+            qm.Prefetch(
+                query=_sparse_to_qdrant(sparse),
+                using="text_sparse",
+                limit=prefetch_k,
+                filter=qfilter,
+            ),
+        ],
+        query=qm.FusionQuery(fusion=qm.Fusion.RRF),
+        limit=top_k,
+        with_payload=True,
+        query_filter=qfilter,
+    )
+    return res.points
+
+
+# === Streamlit Callback ===
+def editor_key_for(file_key: str, page_idx: int, version: int) -> str:
+    return f"editor_{file_key}_{page_idx}_v{version}"
+
+
+def bump_widget_version():
+    st.session_state.widget_version = st.session_state.get("widget_version", 0) + 1
+
+
+def commit_editor_if_dirty(file_key: str, page_idx: int) -> None:
+    """讀 ace/text_area 在 session_state 中的最新值，若與 current_md 對應頁不同就 commit。
+    取代舊版 text_area 的 on_change=commit_edit 流程，
+    讓 ace（無 on_change callback）跟 text_area 走同一條 commit 路徑。"""
+    if not file_key:
+        return
+    version = st.session_state.get("widget_version", 0)
+    key = editor_key_for(file_key, page_idx, version)
+    edited = st.session_state.get(key)
+    if not isinstance(edited, str):
+        return
+    _, _, pages_curr = parse_md(st.session_state.current_md)
+    if page_idx >= len(pages_curr):
+        return
+    _, current_page_md = pages_curr[page_idx]
+    if edited != current_page_md:
+        st.session_state.current_md = replace_page(
+            st.session_state.current_md, page_idx, edited
+        )
+        mark_processing(file_key)
+
+
+# === 圖片刪除／復原邏輯 ===
+def delete_image_action(file_key: str, page_idx: int, ref: dict, image_root: Path):
+    fm, header, pages = parse_md(st.session_state.current_md)
+    page_num, page_md = pages[page_idx]
+
+    new_page_md, removed_line, line_offset = remove_image_line(page_md, ref)
+
+    abs_img = resolve_image_path(file_key, ref["md_path"], image_root)
+    trashed_to = None
+    used_elsewhere = is_ref_used_elsewhere(st.session_state.current_md, page_idx, ref["md_path"])
+
+    if abs_img.exists() and not used_elsewhere:
+        try:
+            trashed_to = move_to_trash(abs_img, file_key)
+        except Exception as e:
+            st.warning(f"圖檔移至垃圾桶失敗：{e}（仍會移除 md 引用）")
+
+    st.session_state.current_md = replace_page(
+        st.session_state.current_md, page_idx, new_page_md
+    )
+    history = st.session_state.delete_history.setdefault(file_key, [])
+    history.append({
+        "page_idx": page_idx,
+        "page_num": page_num,
+        "md_path": ref["md_path"],
+        "removed_line": removed_line,
+        "line_offset": line_offset,
+        "abs_path": str(abs_img),
+        "trash_path": str(trashed_to) if trashed_to else None,
+        "used_elsewhere": used_elsewhere,
+        "deleted_at": now_iso(),
+    })
+    mark_processing(file_key)
+    bump_widget_version()
+
+
+def restore_image_action(file_key: str, history_idx: int):
+    history = st.session_state.delete_history.get(file_key, [])
+    if history_idx < 0 or history_idx >= len(history):
+        return
+    entry = history[history_idx]
+
+    fm, header, pages = parse_md(st.session_state.current_md)
+    page_idx = entry["page_idx"]
+    if page_idx >= len(pages):
+        st.warning("頁面結構改變，無法復原。")
+        return
+    page_num, page_md = pages[page_idx]
+    new_page_md = insert_at(page_md, entry["removed_line"], entry["line_offset"])
+    st.session_state.current_md = replace_page(
+        st.session_state.current_md, page_idx, new_page_md
+    )
+
+    if entry["trash_path"]:
+        trash_path = Path(entry["trash_path"])
+        original = Path(entry["abs_path"])
+        if trash_path.exists():
+            try:
+                restore_from_trash(trash_path, original)
+            except Exception as e:
+                st.warning(f"圖檔還原失敗：{e}（md 引用已復原）")
+
+    history.pop(history_idx)
+    mark_processing(file_key)
+    bump_widget_version()
+
+
+# === UI ===
+st.set_page_config(page_title="RAG MD 比對工具", layout="wide")
+st.title("PDF ↔ Markdown 比對 + Chunk Preview")
+
+# 全域 session_state 初始化
+if "delete_history" not in st.session_state:
+    st.session_state.delete_history = {}
+if "widget_version" not in st.session_state:
+    st.session_state.widget_version = 0
+if "custom_labels" not in st.session_state:
+    # custom_labels[file_key] = {"document": [...], "pages": {idx: [...]}}
+    st.session_state.custom_labels = {}
+if "split_settings" not in st.session_state:
+    # split_settings[file_key] = {"mode": "page"|"delimiter", "delim": "\\n"}
+    st.session_state.split_settings = {}
+if "sidecars" not in st.session_state:
+    # sidecars[file_key] = sidecar dict（mkdata/{stem}.review.json 鏡像）
+    st.session_state.sidecars = {}
+
+with st.sidebar:
+    st.header("設定")
+    data_path_str = st.text_input(
+        "原始資料根目錄", DEFAULT_DATA_PATH,
+        help="process_tracker 內 file_key 的相對基底（PDF/PPT 來源）"
+    )
+    data_path = Path(data_path_str)
+
+    image_root_str = st.text_input(
+        "圖片根目錄", str(MKDATA_PATH),
+        help="包含全部 `{檔名}_image/` 子資料夾的目錄。"
+             "工具會用『檔名 + md 中圖片檔名』自動對應實體位置，"
+             "不依賴 md 內 ![]() 的相對路徑"
+    )
+    image_root = Path(image_root_str)
+
+    auto_soffice = find_soffice()
+    soffice_override = st.text_input(
+        "LibreOffice 路徑（PPT/PPTX 預覽用）",
+        value=auto_soffice or "",
+        help="自動偵測；若未安裝可留空（PPT 將無法 PDF 預覽，但 md 編輯仍可用）。"
+             "或手動指定 soffice.exe 完整路徑。",
+    )
+    soffice_path = find_soffice(soffice_override.strip() or None)
+
+    if not TRACKER.exists():
+        st.error(f"找不到 {TRACKER}")
+        st.stop()
+    tracker = load_tracker()
+    file_keys = sorted(tracker.keys())
+
+    # 每個檔案的 review_status（從 sidecar 直接讀 disk）
+    _file_status_map: dict[str, str] = {
+        fk: get_file_status_quick(fk) for fk in file_keys
+    }
+    _status_counts: dict[str, int] = {s: 0 for s in REVIEW_STATUSES}
+    for s in _file_status_map.values():
+        _status_counts[s] = _status_counts.get(s, 0) + 1
+
+    selected_key = st.selectbox(
+        f"檔案 ({len(file_keys)} 個)",
+        file_keys,
+        format_func=lambda fk: (
+            f"{STATUS_BADGE[_file_status_map[fk]]['emoji']} "
+            f"[{STATUS_BADGE[_file_status_map[fk]]['label']}] {fk}"
+        ),
+        help="前綴 emoji 表示處理狀態，色票對應在下方圖例。"
+             "🔴未處理 / 🟡處理中 / 🟢處理完（已 encode）/ 🔵已寫入庫（已 upsert 到 Qdrant）",
+        key="sidebar_file_selectbox",
+    )
+
+    # 顏色圖例 + 各狀態檔案數
+    legend_chips = "".join(
+        f"<span style='display:inline-block; padding:3px 8px; margin:2px;"
+        f" border-radius:4px; background:{v['bg']}; color:{v['fg']};"
+        f" font-size:11px; font-weight:bold;'>"
+        f"{v['emoji']} {v['label']}：{_status_counts.get(k, 0)}"
+        f"</span>"
+        for k, v in STATUS_BADGE.items()
+    )
+    st.markdown(legend_chips, unsafe_allow_html=True)
+
+    dpi = st.slider("PDF 渲染 DPI", 60, 200, 110, step=10)
+
+    st.divider()
+    st.subheader("圖片校對顯示")
+    img_cols = st.slider("每列圖片數", 1, 5, 3)
+    img_width = st.slider("縮圖寬 (px)", 120, 480, 240, step=20)
+
+    st.divider()
+    st.subheader("Qdrant 連線")
+    qdrant_url = st.text_input(
+        "Qdrant URL", value=QDRANT_DEFAULT_URL,
+        help="Docker server endpoint，例如 http://localhost:6333",
+    )
+    qdrant_api_key = st.text_input(
+        "API key（選填）", value="", type="password",
+        help="本地 Docker 預設沒有 API key；server 模式如有開驗證再填",
+    )
+    qdrant_collection_name = st.text_input(
+        "Collection 名稱", value=QDRANT_TEXT_COLLECTION,
+        help="預設對齊 qdrant格式.md §2。改動代表寫到別的 collection",
+    )
+
+    st.divider()
+    st.caption("提示：編輯區失焦（Tab/點擊外部）後才會自動同步到完整 md。"
+               "刪除圖片會搬到 ./_md_trash/，可在「圖片校對」分頁復原。")
+
+# === 載入選中檔案 ===
+md_path = derive_md_path(selected_key)
+if not md_path.exists():
+    st.error(f"找不到對應 Markdown: {md_path}")
+    st.stop()
+
+if st.session_state.get("loaded_file") != selected_key:
+    st.session_state.current_md = md_path.read_text(encoding="utf-8")
+    st.session_state.loaded_file = selected_key
+    st.session_state.page_idx = 0
+
+    # 載入 sidecar 並 hydrate session_state
+    sidecar = load_sidecar(selected_key)
+    st.session_state.sidecars[selected_key] = sidecar
+    # custom_labels.pages：sidecar 用 str key（JSON 限制），記憶體用 int key
+    sidecar_pages = sidecar["custom_labels"].get("pages", {})
+    pages_dict = {int(k): list(v) for k, v in sidecar_pages.items()}
+    st.session_state.custom_labels[selected_key] = {
+        "document": list(sidecar["custom_labels"].get("document", [])),
+        "pages": pages_dict,
+    }
+    st.session_state.split_settings[selected_key] = dict(sidecar["split_settings"])
+    st.session_state.delete_history[selected_key] = list(sidecar["delete_history"])
+
+    # 第一次載入時 lazy 計算 file_hash（從原始 PDF/PPT 算）
+    if not sidecar.get("file_hash"):
+        source_path = data_path / selected_key
+        sidecar["file_hash"] = compute_file_hash(source_path)
+        # 不立刻寫盤，等下次 mutation 一起 persist；除非已經是空白 sidecar 才寫
+        if not derive_sidecar_path(selected_key).exists():
+            save_sidecar(selected_key, sidecar)
+
+    bump_widget_version()
+
+# 檢索 Tab 跳回用的延遲套用：等檔案載入完才能套 page_idx
+_pending_page = st.session_state.pop("_pending_page_idx", None)
+if _pending_page is not None:
+    st.session_state.page_idx = max(0, int(_pending_page))
+
+# 把上一個 rerun 編輯器的最新內容 commit 進 current_md（吸收 ace / text_area 輸入）
+commit_editor_if_dirty(selected_key, st.session_state.page_idx)
+
+fm, header_section, pages = parse_md(st.session_state.current_md)
+if not pages:
+    st.error("解析不到任何 `## 第 N 頁` 區塊")
+    st.stop()
+
+# === 頁面導覽列 ===
+nav_cols = st.columns([1, 1, 2, 1, 1])
+with nav_cols[0]:
+    if st.button("⟵ 上一頁", use_container_width=True) and st.session_state.page_idx > 0:
+        st.session_state.page_idx -= 1
+        st.rerun()
+with nav_cols[1]:
+    if st.button("下一頁 ⟶", use_container_width=True) and st.session_state.page_idx < len(pages) - 1:
+        st.session_state.page_idx += 1
+        st.rerun()
+with nav_cols[2]:
+    target = st.number_input(
+        "跳到頁碼", min_value=1, max_value=len(pages),
+        value=st.session_state.page_idx + 1, label_visibility="collapsed",
+    )
+    if target - 1 != st.session_state.page_idx:
+        st.session_state.page_idx = target - 1
+        st.rerun()
+with nav_cols[3]:
+    if st.button("儲存 .md", type="primary", use_container_width=True):
+        md_path.write_text(st.session_state.current_md, encoding="utf-8")
+        mark_processing(selected_key)
+        # 磁碟已動：捨棄編輯無法再無痛還原 prior_status（會留在 processing）
+        sc = st.session_state.sidecars.get(selected_key)
+        if sc is not None:
+            sc["disk_dirty"] = True
+            persist_review_state(selected_key)
+        st.success(f"已儲存 → {md_path.name}")
+with nav_cols[4]:
+    if st.button("捨棄編輯", use_container_width=True):
+        st.session_state.current_md = md_path.read_text(encoding="utf-8")
+        st.session_state.delete_history[selected_key] = []
+        # 還原：若進入 processing 前是 encoded/ingested 且磁碟未被儲存，回去原狀態
+        sc = st.session_state.sidecars.get(selected_key)
+        if sc is not None:
+            prior = sc.get("prior_status")
+            dirty = sc.get("disk_dirty", False)
+            if prior and not dirty:
+                sc["review_status"] = prior
+                sc.pop("prior_status", None)
+                sc.pop("disk_dirty", None)
+        persist_review_state(selected_key)
+        bump_widget_version()
+        st.rerun()
+
+current_idx = st.session_state.page_idx
+page_num, page_md = pages[current_idx]
+
+parts = split_key_parts(selected_key)
+project_name = parts[0] if len(parts) > 1 else "未分類"
+file_name = parts[-1]
+sidecar = st.session_state.sidecars[selected_key]
+file_hash_display = sidecar.get("file_hash") or fm.get("file_hash", "—") or "—"
+st.markdown(
+    f"**建案**：`{project_name}` ｜ **檔名**：`{file_name}` ｜ "
+    f"**第 {page_num} / {len(pages)} 頁** ｜ **file_hash**：`{file_hash_display[:12] if file_hash_display != '—' else '—'}`"
+)
+
+# === Review 狀態列 + 文字暫存區 ===
+_status = sidecar.get("review_status", "unprocessed")
+_badge = STATUS_BADGE.get(_status, STATUS_BADGE["unprocessed"])
+badge_html = (
+    f"<div style='display:inline-block; padding:8px 18px; border-radius:8px; "
+    f"background-color:{_badge['bg']}; color:{_badge['fg']}; "
+    f"font-weight:bold; font-size:1.1em;'>"
+    f"{_badge['emoji']} {_badge['label']}"
+    f"</div>"
+)
+status_cols = st.columns([1, 1, 3])
+with status_cols[0]:
+    st.markdown(
+        "**狀態**",
+        help="自動轉換：開檔=🔴未處理；任何編輯=🟡處理中；最後一頁 Qdrant 上傳成功=🟢已完成",
+    )
+    st.markdown(badge_html, unsafe_allow_html=True)
+with status_cols[1]:
+    st.markdown("**完成時間**")
+    st.markdown(f"`{sidecar.get('reviewed_at') or '— (尚未完成)'}`")
+with status_cols[2]:
+    st.markdown(
+        "**📋 文字暫存區**",
+        help="per-file 暫存；高度依內容即時自動調整（3-20 行範圍）。"
+             "僅當前文件 session 內有效（不寫盤、不跨檔，但跨頁保留）。",
+    )
+    scratch_key = f"scratch_text_{selected_key}"
+    if HAS_ACE:
+        # 用 st_ace 取代 text_area —— 高度按內容 auto-grow（min_lines~max_lines）、
+        # 不需 Ctrl+Enter；session_state[key] 跨 rerun/跨頁穩定持久
+        st_ace(
+            language="plain_text",
+            theme="chrome",
+            font_size=13,
+            show_gutter=False,
+            wrap=True,
+            auto_update=True,
+            min_lines=3,
+            max_lines=20,
+            key=scratch_key,
+        )
+    else:
+        # fallback：text_area 無 auto-grow，固定高度
+        st.text_area(
+            "scratch",
+            height=250,
+            placeholder="貼上多行文字（請安裝 streamlit-ace 以獲得 auto-grow）...",
+            key=scratch_key,
+            label_visibility="collapsed",
+        )
+
+# === 五分頁主區 ===
+tab_pdf, tab_img, tab_meta, tab_embed, tab_qdrant, tab_search = st.tabs(
+    ["1. PDF比對", "2. 圖片校對", "3. 標籤預覽", "4. Embedding", "5. Qdrant 寫入", "6. 檢索測試"]
+)
+
+# --- 分頁 1：PDF 比對 ---
+with tab_pdf:
+    col_pdf, col_md = st.columns(2)
+
+    with col_pdf:
+        st.subheader("PDF 原頁")
+        source_path = data_path / selected_key
+        ext = source_path.suffix.lower()
+        if not source_path.exists():
+            st.warning(f"找不到原始檔：{source_path}")
+        elif ext in (".ppt", ".pptx") and not soffice_path:
+            st.warning(
+                "此檔為 PPT/PPTX，需 LibreOffice 才能預覽 PDF。"
+                "請安裝 LibreOffice 或在左側 sidebar 指定 soffice.exe 路徑。"
+                "（Markdown 編輯與圖片校對不受影響）"
+            )
+        else:
+            try:
+                pdf_path = ensure_pdf(source_path, soffice_path)
+                png_bytes = render_pdf_page_png(pdf_path, page_num - 1, dpi=dpi)
+                st.image(png_bytes, use_container_width=True)
+            except Exception as e:
+                st.error(f"PDF 渲染失敗：\n```\n{e}\n```")
+
+    with col_md:
+        st.subheader("Markdown 內容（可編輯）")
+        editor_key = editor_key_for(selected_key, current_idx, st.session_state.widget_version)
+        if HAS_ACE:
+            st_ace(
+                value=page_md,
+                language="markdown",
+                theme="chrome",
+                keybinding="vscode",      # Alt+↑/↓ 移行、Ctrl+Alt+↑/↓ 多游標等整套
+                font_size=14,
+                tab_size=2,
+                show_gutter=True,
+                wrap=True,
+                auto_update=True,          # 失焦立刻回 value，commit_editor_if_dirty 下次 rerun 撈
+                min_lines=30,
+                key=editor_key,
+            )
+        else:
+            st.warning(
+                "未安裝 `streamlit-ace`，暫用基本編輯器（無 Alt+↑↓ / 多游標）。"
+                "安裝後可獲 VSCode 級編輯：`pip install streamlit-ace`"
+            )
+            st.text_area(
+                "Page Markdown",
+                value=page_md,
+                height=600,
+                key=editor_key,
+                label_visibility="collapsed",
+            )
+
+# --- 分頁 2：圖片校對 ---
+with tab_img:
+    st.subheader("頁面圖片")
+    refs = parse_images_in_page(page_md)
+    if not refs:
+        st.info("本頁無圖片引用。")
+    else:
+        for row_start in range(0, len(refs), img_cols):
+            row_refs = refs[row_start: row_start + img_cols]
+            cols = st.columns(img_cols)
+            for i, ref in enumerate(row_refs):
+                with cols[i]:
+                    abs_img = resolve_image_path(selected_key, ref["md_path"], image_root)
+                    caption = Path(ref["md_path"]).name
+                    if abs_img.exists():
+                        try:
+                            st.image(str(abs_img), caption=caption, width=img_width)
+                        except Exception as e:
+                            st.warning(f"無法顯示：{e}")
+                    else:
+                        st.warning(f"檔案不存在：{abs_img}")
+                    st.caption(f"md 引用：`{ref['md_path']}`")
+                    if st.button(
+                        "🗑️ 刪除",
+                        key=f"del_{current_idx}_{row_start + i}_v{st.session_state.widget_version}",
+                        use_container_width=True,
+                    ):
+                        delete_image_action(selected_key, current_idx, ref, image_root)
+                        st.rerun()
+
+    history = st.session_state.delete_history.get(selected_key, [])
+    if history:
+        st.divider()
+        with st.expander(f"近期刪除（{len(history)} 筆，可復原）", expanded=False):
+            for j, entry in enumerate(history):
+                cols = st.columns([3, 2, 1])
+                cols[0].markdown(
+                    f"P{entry['page_num']}：`{Path(entry['md_path']).name}`"
+                )
+                if entry["trash_path"]:
+                    cols[1].caption("已搬到垃圾桶")
+                elif entry["used_elsewhere"]:
+                    cols[1].caption("檔案被他頁引用，未搬移")
+                else:
+                    cols[1].caption("僅移除引用")
+                if cols[2].button("↩ 復原", key=f"restore_{j}_v{st.session_state.widget_version}"):
+                    restore_image_action(selected_key, j)
+                    st.rerun()
+
+# --- 分頁 3：標籤預覽 ---
+with tab_meta:
+    # 取最新內容 + 取得當前 file 的 label/split state
+    # 安全網：text_area 在 tab 切換時可能未觸發 on_change，所以優先讀 widget 的即時值
+    fm_now, _, pages_now = parse_md(st.session_state.current_md)
+    editor_key_current = editor_key_for(
+        selected_key, current_idx, st.session_state.widget_version
+    )
+    edited_now = st.session_state.get(editor_key_current)
+    # ace 在首次掛載時可能回 None；只在拿到字串時才採用 widget 值
+    if isinstance(edited_now, str):
+        page_md_now = edited_now
+    else:
+        _, page_md_now = pages_now[current_idx]
+
+    file_labels = st.session_state.custom_labels.setdefault(
+        selected_key, {"document": [], "pages": {}}
+    )
+    doc_labels = file_labels["document"]
+    page_labels = file_labels["pages"].setdefault(current_idx, [])
+
+    split_cfg = st.session_state.split_settings.setdefault(
+        selected_key, {"mode": "delimiter", "delim": "\\n"}
+    )
+
+    h1_value = extract_h1(st.session_state.current_md, Path(file_name).stem)
+    h2_value = f"第 {page_num} 頁"
+    sections = split_page_by_headings(page_md_now)
+
+    # 收集本頁所有出現過的 heading（按 level 分群、去重保序）
+    heading_pool: dict[int, list[str]] = {}
+    for sec in sections:
+        for lvl, title in sec["headings"].items():
+            bucket = heading_pool.setdefault(lvl, [])
+            if title not in bucket:
+                bucket.append(title)
+    total_h_count = sum(len(v) for v in heading_pool.values())
+
+    img_labels = [
+        (derive_image_label_key(s["headings"], s["body"]), s["image_paths"])
+        for s in sections if s["image_paths"]
+    ]
+
+    # === 區塊 A：自動 heading + 圖片 標籤 ===
+    st.markdown("### Heading & 圖片自動標籤")
+    st.caption(
+        f"🔵 heading（h1/h2 + h3-h6 任意階） · "
+        f"🖼️ 圖片（key=最深 heading／單行內容／image） · "
+        f"本頁 {total_h_count} 個子標題、{len(img_labels)} 個圖片標籤"
+    )
+    head_chips: list[tuple[str, str, str]] = [
+        ("🔵", "h1", h1_value), ("🔵", "h2", h2_value),
+    ]
+    for lvl in sorted(heading_pool.keys()):
+        titles = heading_pool[lvl]
+        for hi, t in enumerate(titles):
+            key = f"h{lvl}#{hi + 1}" if len(titles) > 1 else f"h{lvl}"
+            head_chips.append(("🔵", key, t))
+    for label_key, paths in img_labels:
+        head_chips.append(("🖼️", label_key, "\n".join(paths)))
+
+    per_row = 6
+    for r_start in range(0, len(head_chips), per_row):
+        row = head_chips[r_start: r_start + per_row]
+        head_cols = st.columns(per_row)
+        for i, (em, k, v) in enumerate(row):
+            with head_cols[i]:
+                with st.popover(f"{em} {k}", use_container_width=True):
+                    st.markdown(f"**{k}**")
+                    st.text(v)
+
+    st.divider()
+
+    # === 區塊 B：自訂標籤 ===
+    st.markdown("### 自訂標籤")
+    st.caption("🟢 整份文件 / 🟡 僅當頁。點 chip 可看內容並刪除。")
+
+    custom_chips = (
+        [("doc", i, lab) for i, lab in enumerate(doc_labels)]
+        + [("page", i, lab) for i, lab in enumerate(page_labels)]
+    )
+    if custom_chips:
+        per_row = 6
+        for row_start in range(0, len(custom_chips), per_row):
+            row = custom_chips[row_start: row_start + per_row]
+            cols = st.columns(per_row)
+            for ci, (scope, li, lab) in enumerate(row):
+                emoji = "🟢" if scope == "doc" else "🟡"
+                with cols[ci]:
+                    with st.popover(f"{emoji} {lab['key']}", use_container_width=True):
+                        scope_text = "整份文件" if scope == "doc" else f"僅 P{page_num}"
+                        st.markdown(f"**{lab['key']}** ({scope_text})")
+                        st.text(lab["value"])
+                        btn_key = f"rmlbl_{scope}_{li}_{current_idx}_v{st.session_state.widget_version}"
+                        if st.button("🗑️ 刪除此標籤", key=btn_key):
+                            target = doc_labels if scope == "doc" else page_labels
+                            target.pop(li)
+                            mark_processing(selected_key)
+                            bump_widget_version()
+                            st.rerun()
+    else:
+        st.caption("（尚無自訂標籤）")
+
+    with st.expander("➕ 新增標籤", expanded=False):
+        nk_key = f"new_lbl_k_{selected_key}_{current_idx}_v{st.session_state.widget_version}"
+        nv_key = f"new_lbl_v_{selected_key}_{current_idx}_v{st.session_state.widget_version}"
+        ns_key = f"new_lbl_s_{selected_key}_{current_idx}_v{st.session_state.widget_version}"
+        new_key_val = st.text_input("標籤名 (key)", key=nk_key, placeholder="例：context")
+        new_val_val = st.text_area("內容 (value)", key=nv_key, height=80,
+                                    placeholder="例：璞真建設股份有限公司台北...")
+        new_scope = st.radio("適用範圍", ["🟢 整份文件", "🟡 僅當頁"],
+                             horizontal=True, key=ns_key)
+        if st.button("加入標籤", type="primary"):
+            if not new_key_val.strip() or not new_val_val.strip():
+                st.warning("標籤名與內容皆不可空白")
+            else:
+                entry = {"key": new_key_val.strip(), "value": new_val_val.strip()}
+                if new_scope.startswith("🟢"):
+                    doc_labels.append(entry)
+                else:
+                    page_labels.append(entry)
+                mark_processing(selected_key)
+                bump_widget_version()
+                st.rerun()
+
+    st.divider()
+
+    # === 區塊 C：切分設定 ===
+    st.markdown("### 切分設定")
+    sc1, sc2 = st.columns([1, 2])
+    with sc1:
+        mode_label = st.radio(
+            "模式",
+            ["整頁 1 chunk", "依分隔字元"],
+            index=0 if split_cfg["mode"] == "page" else 1,
+            key=f"split_mode_radio_{selected_key}",
+        )
+        new_mode = "page" if mode_label == "整頁 1 chunk" else "delimiter"
+    with sc2:
+        if new_mode == "delimiter":
+            new_delim = st.text_input(
+                "分隔字元（支援 `\\n` `\\t` 等 escape）",
+                value=split_cfg["delim"],
+                key=f"split_delim_input_{selected_key}",
+            )
+        else:
+            new_delim = split_cfg["delim"]
+            st.caption("整頁模式不需分隔字元。")
+    if split_cfg["mode"] != new_mode or split_cfg["delim"] != new_delim:
+        split_cfg["mode"] = new_mode
+        split_cfg["delim"] = new_delim
+        mark_processing(selected_key)
+
+    st.divider()
+
+    # === 區塊 D：切分結果 + chunks（對齊 qdrant格式.md v2.0.0 payload）===
+    st.markdown("### 切分結果")
+    st.caption(
+        "每筆 chunk = Qdrant 一個 point。`text_with_prefix` 是真正餵 embedding 的內容；"
+        "`text` 是純文字（給 LLM 上下文）。`id` 由 `uuid5(file_hash|page|section|chunk)` 算出，重 embed 自動覆蓋。"
+    )
+
+    all_chunks = build_all_chunks_for_doc(
+        file_key=selected_key,
+        sidecar=sidecar,
+        pages=pages_now,
+        page_md_override={current_idx: page_md_now},
+        h1=h1_value,
+        doc_labels=doc_labels,
+        file_labels=file_labels,
+        split_cfg=split_cfg,
+        image_root=image_root,
+    )
+    current_chunks = [c for c in all_chunks if c["_page_pos"] == current_idx]
+
+    if not current_chunks:
+        st.info("本頁切分後無內容（可能是空頁或純圖片頁）。")
+
+    for n, pkg in enumerate(current_chunks, start=1):
+        payload = pkg["payload"]
+        src = payload["metadata"]["source"]
+        loc = payload["metadata"]["location"]
+        vis = payload["visuals"]
+        lbls = payload["labels"]
+        content = payload["content"]
+        chunking = payload["chunking"]
+
+        with st.container(border=True):
+            head_line = (
+                f"**Chunk {n}** · {content['char_count']} 字元 · "
+                f"`id={pkg['id'][:8]}…`"
+            )
+            if loc["headings"]:
+                deepest_lvl = max(int(k) for k in loc["headings"].keys())
+                head_line += f" · 來自 `{'#' * deepest_lvl} {loc['current_header']}`"
+            if vis["has_image"]:
+                head_line += f" · 含 {vis['image_count']} 張圖"
+            st.markdown(head_line)
+
+            chips: list[tuple[str, str, str]] = [
+                ("🔵", "h1", src["doc_title"]),
+                ("🔵", "h2", loc["page_label"]),
+            ]
+            for lvl_str in sorted(loc["headings"].keys(), key=int):
+                chips.append(("🔵", f"h{lvl_str}", loc["headings"][lvl_str]))
+            if vis["has_image"]:
+                img_summary = "\n".join(img["local_path"] for img in vis["images"])
+                chips.append(("🖼️", vis["image_label"], img_summary))
+            for lab in lbls["document"]:
+                chips.append(("🟢", lab["key"], lab["value"]))
+            for lab in lbls["page"]:
+                chips.append(("🟡", lab["key"], lab["value"]))
+            chips.append(("🔗", "prev", chunking["prev_chunk_id"] or "—"))
+            chips.append(("🔗", "next", chunking["next_chunk_id"] or "—"))
+
+            cper_row = 6
+            for r_start in range(0, len(chips), cper_row):
+                chunk_row = chips[r_start: r_start + cper_row]
+                cc = st.columns(cper_row)
+                for ii, (em, k, v) in enumerate(chunk_row):
+                    with cc[ii]:
+                        with st.popover(f"{em} {k}", use_container_width=True):
+                            st.markdown(f"**{k}**")
+                            st.text(v)
+
+            st.markdown("**text_with_prefix（embedding 輸入）：**")
+            st.code(content["text_with_prefix"], language="markdown")
+
+    def _strip_internal(c: dict) -> dict:
+        return {k: v for k, v in c.items() if not k.startswith("_")}
+
+    if current_chunks:
+        st.download_button(
+            "下載本頁所有 chunks (JSON)",
+            data=json.dumps(
+                [_strip_internal(c) for c in current_chunks],
+                ensure_ascii=False, indent=2,
+            ),
+            file_name=f"{Path(file_name).stem}_p{page_num}_chunks.json",
+            mime="application/json",
+        )
+
+    with st.expander(f"檢視整份文件所有 chunks payload（{len(all_chunks)} 筆）"):
+        st.json([_strip_internal(c) for c in all_chunks])
+
+# --- 分頁 4：Embedding ---
+with tab_embed:
+    st.subheader("Embedding (bge-m3 hybrid)")
+    st.caption(
+        "dense (1024) + learned sparse 一次推理產出。"
+        "快取存 mkdata/{stem}.vectors.{dense.npy,sparse.json,manifest.json}。"
+    )
+
+    # === 設定列 ===
+    cfg_cols = st.columns([2, 2, 1, 2])
+    with cfg_cols[0]:
+        model_name = st.selectbox(
+            "模型", AVAILABLE_EMBEDDERS, index=0, key="embed_model",
+        )
+    with cfg_cols[1]:
+        batch_size = st.slider(
+            "Batch size", 4, 128, 32, step=4, key="embed_batch",
+            help="4090 24GB 可推到 64-128；OOM 就調小",
+        )
+    with cfg_cols[2]:
+        use_fp16 = st.toggle(
+            "FP16", value=True, key="embed_fp16",
+            help="省 VRAM 與磁碟（dense 存 float16）",
+        )
+    with cfg_cols[3]:
+        st.caption(
+            f"`pipeline={PIPELINE_VERSION}` · "
+            f"`embed_ver={EMBEDDING_VERSION}` · "
+            f"`chunking={CHUNKING_STRATEGY}`"
+        )
+
+    # === 重建當前文件的 chunks（與 Tab 3 同步邏輯）===
+    fm_emb, _, pages_emb = parse_md(st.session_state.current_md)
+    editor_key_emb = editor_key_for(
+        selected_key, current_idx, st.session_state.widget_version
+    )
+    edited_emb = st.session_state.get(editor_key_emb)
+    if isinstance(edited_emb, str):
+        page_md_emb = edited_emb
+    else:
+        _, page_md_emb = pages_emb[current_idx]
+    file_labels_emb = st.session_state.custom_labels.setdefault(
+        selected_key, {"document": [], "pages": {}}
+    )
+    doc_labels_emb = file_labels_emb["document"]
+    split_cfg_emb = st.session_state.split_settings.setdefault(
+        selected_key, {"mode": "delimiter", "delim": "\\n"}
+    )
+    h1_emb = extract_h1(st.session_state.current_md, Path(file_name).stem)
+
+    all_chunks_emb = build_all_chunks_for_doc(
+        file_key=selected_key,
+        sidecar=sidecar,
+        pages=pages_emb,
+        page_md_override={current_idx: page_md_emb},
+        h1=h1_emb,
+        doc_labels=doc_labels_emb,
+        file_labels=file_labels_emb,
+        split_cfg=split_cfg_emb,
+        image_root=image_root,
+    )
+    expected_chunk_ids = [c["id"] for c in all_chunks_emb]
+    is_last_page = current_idx == len(pages_emb) - 1
+    last_page_num = pages_emb[-1][0] if pages_emb else None
+
+    if not is_last_page:
+        st.warning(
+            f"⏭️ 「全檔批次 encode」需在最後一頁（P{last_page_num}）才能執行，"
+            f"目前在 P{page_num}。請通讀全部內容後切到末頁再上傳。"
+            "（本頁即時 encode 預覽 / 清除快取 不受限）"
+        )
+
+    st.divider()
+
+    # === 區塊 1：快取狀態 ===
+    st.markdown("### 快取狀態")
+    cache_status = vector_cache_status(selected_key, sidecar, expected_chunk_ids)
+    paths_disp = derive_vector_paths(selected_key)
+
+    if not cache_status["exists"]:
+        st.warning(
+            f"無向量快取（共 {len(expected_chunk_ids)} 個 chunks 待 embed）"
+        )
+    elif cache_status["valid"]:
+        m = cache_status["manifest"]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("向量數", m.get("count", 0))
+        c2.metric("dense dim", m.get("dense_dim", 0))
+        c3.metric("dtype", m.get("dense_dtype", "—"))
+        c4.metric(
+            "dense 檔大小",
+            f"{paths_disp['dense'].stat().st_size / 1024:.1f} KB"
+            if paths_disp["dense"].exists() else "—",
+        )
+        st.success(f"✓ 快取有效 · 編碼於 {m.get('encoded_at', '—')}")
+    else:
+        st.error(f"⚠ 快取失效：{cache_status['reason']} → 需要重新編碼")
+
+    # === 操作列 ===
+    op_cols = st.columns([2, 2, 2])
+    encode_disabled = (not expected_chunk_ids) or (not is_last_page)
+    encode_help = (
+        f"需先切到最後一頁（P{last_page_num}）。"
+        if not is_last_page else None
+    )
+    with op_cols[0]:
+        if st.button(
+            "全檔批次 encode",
+            type="primary",
+            use_container_width=True,
+            disabled=encode_disabled,
+            help=encode_help,
+            key="btn_full_encode",
+        ):
+            try:
+                embedder = load_embedder(model_name, use_fp16)
+            except Exception as e:
+                st.error(f"模型載入失敗：\n```\n{e}\n```")
+                embedder = None
+
+            if embedder is not None:
+                texts = [
+                    c["payload"]["content"]["text_with_prefix"]
+                    for c in all_chunks_emb
+                ]
+                total = len(texts)
+                progress = st.progress(0.0, text=f"Encoding 0 / {total}...")
+                dense_chunks: list[np.ndarray] = []
+                sparse_all: list[dict] = []
+                t0 = time.time()
+                try:
+                    for start in range(0, total, batch_size):
+                        batch = texts[start:start + batch_size]
+                        d, s = encode_chunks(embedder, batch, batch_size=batch_size)
+                        dense_chunks.append(d)
+                        sparse_all.extend(s)
+                        done = start + len(batch)
+                        progress.progress(
+                            done / total,
+                            text=f"Encoding {done} / {total}...",
+                        )
+                    dense_all = np.concatenate(dense_chunks, axis=0)
+                    save_vectors(
+                        selected_key, sidecar,
+                        expected_chunk_ids, dense_all, sparse_all,
+                        fp16=use_fp16,
+                    )
+                    elapsed = time.time() - t0
+                    progress.empty()
+                    # ✓ 本地向量已建 → 狀態 🟢 encoded（綠）
+                    mark_encoded(selected_key)
+                    st.success(
+                        f"✓ {total} 個 chunks 已 encode + cache · "
+                        f"{elapsed:.1f}s · {total / elapsed:.1f} chunks/s"
+                        f" · 狀態 → 🟢 處理完"
+                    )
+                    st.info("接下來到 Tab 5 上傳到 Qdrant，狀態才會轉為 🔵 已寫入庫。")
+                    st.rerun()
+                except Exception as e:
+                    progress.empty()
+                    st.error(f"Encode 失敗：\n```\n{e}\n```")
+
+    with op_cols[1]:
+        if st.button(
+            "清除快取", use_container_width=True, key="btn_clear_cache",
+        ):
+            n = clear_vector_cache(selected_key)
+            st.info(f"已刪除 {n} 個快取檔")
+            st.rerun()
+
+    with op_cols[2]:
+        st.caption(
+            "重 ingest 規則：file_hash／chunking_strategy／embedding_model／"
+            "embedding_version 任一變動就會失效。"
+        )
+
+    st.divider()
+
+    # === 區塊 2：本頁即時 embed 預覽 ===
+    st.markdown("### 本頁 chunks 即時編碼預覽")
+    st.caption("不寫快取，純粹驗證模型輸出與量級。")
+
+    current_chunks_emb = [
+        c for c in all_chunks_emb if c["_page_pos"] == current_idx
+    ]
+    if not current_chunks_emb:
+        st.info("本頁無 chunks。")
+    else:
+        st.caption(f"本頁 {len(current_chunks_emb)} 個 chunks。")
+        if st.button(
+            "Embed 本頁",
+            key="btn_preview_encode",
+            use_container_width=True,
+        ):
+            try:
+                embedder = load_embedder(model_name, use_fp16)
+            except Exception as e:
+                st.error(f"模型載入失敗：\n```\n{e}\n```")
+                embedder = None
+
+            if embedder is not None:
+                texts = [
+                    c["payload"]["content"]["text_with_prefix"]
+                    for c in current_chunks_emb
+                ]
+                t0 = time.time()
+                try:
+                    dense, sparse = encode_chunks(
+                        embedder, texts, batch_size=batch_size
+                    )
+                    elapsed = time.time() - t0
+                    rows = []
+                    for c, d, s in zip(current_chunks_emb, dense, sparse):
+                        text_prev = c["payload"]["content"]["text_with_prefix"]
+                        rows.append({
+                            "id": c["id"][:8] + "…",
+                            "preview": text_prev[:60] + ("…" if len(text_prev) > 60 else ""),
+                            "dense_norm": round(float(np.linalg.norm(d)), 4),
+                            "sparse_nnz": len(s),
+                        })
+                    st.dataframe(rows, use_container_width=True, hide_index=True)
+                    st.caption(
+                        f"耗時 {elapsed:.2f}s · {len(texts) / elapsed:.1f} chunks/s · "
+                        f"dense shape={tuple(dense.shape)} · "
+                        f"sparse avg nnz={sum(len(s) for s in sparse) / len(sparse):.1f}"
+                    )
+                except Exception as e:
+                    st.error(f"Encode 失敗：\n```\n{e}\n```")
+
+# --- 分頁 5：Qdrant 寫入 ---
+with tab_qdrant:
+    st.subheader("Qdrant 寫入（hybrid: dense + sparse）")
+    st.caption(
+        "把本地快取的向量 + 即時 chunk payload upsert 到 Qdrant。"
+        "deterministic point id 確保同檔重傳直接覆蓋，不會產生重複。"
+        f" Collection schema 對齊 `qdrant格式.md §2`。"
+    )
+
+    if not HAS_QDRANT:
+        st.error(
+            "qdrant-client 未安裝：\n```\npip install qdrant-client\n```"
+        )
+        st.stop()
+
+    # === 區塊 1：連線測試 ===
+    st.markdown("### 連線狀態")
+    conn_cols = st.columns([2, 1])
+    with conn_cols[0]:
+        st.markdown(
+            f"**URL**：`{qdrant_url}` ｜ **Collection**：`{qdrant_collection_name}`"
+        )
+    with conn_cols[1]:
+        ping = st.button("🔌 連線測試", use_container_width=True, key="qd_ping")
+
+    client = None
+    conn_ok = False
+    try:
+        client = get_qdrant_client(qdrant_url, qdrant_api_key)
+        # 輕量探測：列出 collections
+        _ = client.get_collections()
+        conn_ok = True
+        if ping:
+            st.success(f"✓ 已連線：{qdrant_url}")
+    except Exception as e:
+        st.error(f"連線失敗：\n```\n{e}\n```")
+        conn_ok = False
+
+    if not conn_ok:
+        st.stop()
+
+    # === 區塊 2：Collection 狀態 + 管理 ===
+    st.markdown("### Collection")
+    coll_exists = client.collection_exists(qdrant_collection_name)
+    coll_total = get_collection_total(client, qdrant_collection_name) if coll_exists else 0
+
+    coll_cols = st.columns(4)
+    coll_cols[0].metric("存在", "是" if coll_exists else "否")
+    coll_cols[1].metric("總 points", coll_total)
+    coll_cols[2].metric("dense dim", EMBEDDING_DIM_DENSE)
+    coll_cols[3].metric("vectors", "dense + sparse")
+
+    coll_op_cols = st.columns([1, 2, 2])
+    with coll_op_cols[0]:
+        if not coll_exists and st.button(
+            "建立 collection",
+            type="primary",
+            use_container_width=True,
+            key="qd_create",
+        ):
+            try:
+                info = ensure_text_collection(client, qdrant_collection_name, recreate=False)
+                st.success(
+                    f"✓ collection 建立完成 · payload indexes：{len(info['indexed'])} 個"
+                )
+                st.rerun()
+            except Exception as e:
+                st.error(f"建立失敗：\n```\n{e}\n```")
+    with coll_op_cols[1]:
+        confirm_recreate = st.checkbox(
+            "確認重建（會刪光現有資料）",
+            value=False,
+            key="qd_confirm_recreate",
+        )
+    with coll_op_cols[2]:
+        if st.button(
+            "🗑️ 重建 collection",
+            use_container_width=True,
+            disabled=not confirm_recreate or not coll_exists,
+            key="qd_recreate",
+        ):
+            try:
+                info = ensure_text_collection(client, qdrant_collection_name, recreate=True)
+                st.success(
+                    f"✓ collection 重建完成 · payload indexes：{len(info['indexed'])} 個"
+                )
+                st.rerun()
+            except Exception as e:
+                st.error(f"重建失敗：\n```\n{e}\n```")
+
+    if not coll_exists:
+        st.info("📌 先建立 collection 再上傳。")
+        st.stop()
+
+    st.divider()
+
+    # === 區塊 3：本檔 ingest 預覽 ===
+    st.markdown("### 本檔上傳預覽")
+
+    # 重建 chunks（與 Tab 3/4 同邏輯）
+    fm_qd, _, pages_qd = parse_md(st.session_state.current_md)
+    editor_key_qd = editor_key_for(
+        selected_key, current_idx, st.session_state.widget_version
+    )
+    edited_qd = st.session_state.get(editor_key_qd)
+    if isinstance(edited_qd, str):
+        page_md_qd = edited_qd
+    else:
+        _, page_md_qd = pages_qd[current_idx]
+    file_labels_qd = st.session_state.custom_labels.setdefault(
+        selected_key, {"document": [], "pages": {}}
+    )
+    doc_labels_qd = file_labels_qd["document"]
+    split_cfg_qd = st.session_state.split_settings.setdefault(
+        selected_key, {"mode": "delimiter", "delim": "\\n"}
+    )
+    h1_qd = extract_h1(st.session_state.current_md, Path(file_name).stem)
+    all_chunks_qd = build_all_chunks_for_doc(
+        file_key=selected_key,
+        sidecar=sidecar,
+        pages=pages_qd,
+        page_md_override={current_idx: page_md_qd},
+        h1=h1_qd,
+        doc_labels=doc_labels_qd,
+        file_labels=file_labels_qd,
+        split_cfg=split_cfg_qd,
+        image_root=image_root,
+    )
+    expected_chunk_ids_qd = [c["id"] for c in all_chunks_qd]
+
+    file_hash_now = sidecar.get("file_hash", "")
+    existing_for_file = count_existing_for_file(
+        client, qdrant_collection_name, file_hash_now
+    )
+    cache_status_qd = vector_cache_status(
+        selected_key, sidecar, expected_chunk_ids_qd
+    )
+    is_last_page_qd = current_idx == len(pages_qd) - 1
+    last_page_num_qd = pages_qd[-1][0] if pages_qd else None
+
+    prev_cols = st.columns(4)
+    prev_cols[0].metric("本檔 chunks", len(expected_chunk_ids_qd))
+    prev_cols[1].metric("Qdrant 已存在", existing_for_file)
+    prev_cols[2].metric(
+        "本地快取",
+        "✓ valid" if cache_status_qd["valid"] else "✗ invalid",
+    )
+    prev_cols[3].metric(
+        "操作",
+        "覆蓋" if existing_for_file > 0 else "新增",
+    )
+
+    # === 區塊 4：阻擋條件 ===
+    blockers: list[str] = []
+    if not is_last_page_qd:
+        blockers.append(
+            f"⏭️ 需切到最後一頁（P{last_page_num_qd}）才能上傳；目前 P{page_num}"
+        )
+    if not cache_status_qd["valid"]:
+        blockers.append(
+            f"❌ 本地向量快取無效：{cache_status_qd.get('reason', '?')}"
+            f" → 先到 Tab 4 重新 encode"
+        )
+    if not expected_chunk_ids_qd:
+        blockers.append("❌ 本檔無可上傳 chunks")
+    if not file_hash_now:
+        blockers.append("⚠️ file_hash 為空（原始檔找不到？），上傳但無法重複偵測")
+
+    for msg in blockers:
+        st.warning(msg)
+
+    # === 區塊 5：上傳 ===
+    upload_disabled = bool([b for b in blockers if b.startswith("❌") or b.startswith("⏭️")])
+    if st.button(
+        "🚀 上傳到 Qdrant",
+        type="primary",
+        use_container_width=True,
+        disabled=upload_disabled,
+        key="qd_upload",
+    ):
+        try:
+            with st.spinner("讀取本地快取..."):
+                dense_cached, sparse_cached, manifest_cached = load_cached_vectors(
+                    selected_key
+                )
+            # 防呆對齊
+            if manifest_cached.get("chunk_ids") != expected_chunk_ids_qd:
+                st.error(
+                    "快取的 chunk_ids 與當前 chunks 不一致，請到 Tab 4 重新 encode。"
+                )
+            else:
+                ingestion_ts = now_iso()
+                points = build_points_for_upsert(
+                    all_chunks_qd, dense_cached, sparse_cached, ingestion_ts
+                )
+                total = len(points)
+                progress = st.progress(0.0, text=f"Upsert 0 / {total}...")
+                t0 = time.time()
+
+                def _cb(done: int, t: int) -> None:
+                    progress.progress(
+                        done / t if t else 1.0,
+                        text=f"Upsert {done} / {t}...",
+                    )
+
+                upsert_in_batches(
+                    client, qdrant_collection_name, points,
+                    batch_size=QDRANT_BATCH_SIZE, progress_cb=_cb,
+                )
+                elapsed = time.time() - t0
+                progress.empty()
+
+                # ✓ 寫入成功 → 狀態轉 🔵 ingested
+                mark_ingested(selected_key)
+                st.success(
+                    f"✓ {total} 個 points 已上傳 · {elapsed:.1f}s · "
+                    f"{total / elapsed:.1f} pts/s · 狀態 → 🔵 已寫入庫"
+                )
+                st.balloons()
+                st.rerun()
+        except Exception as e:
+            st.error(f"上傳失敗：\n```\n{e}\n```")
+
+    st.divider()
+
+    # === 區塊 6：smoke query 驗證 ===
+    with st.expander("🔍 上傳後驗證（scroll 抓本檔前 5 個 points）"):
+        if st.button(
+            "查詢本檔 points", key="qd_scroll", disabled=not file_hash_now,
+        ):
+            try:
+                hits, _ = client.scroll(
+                    collection_name=qdrant_collection_name,
+                    scroll_filter=qm.Filter(must=[
+                        qm.FieldCondition(
+                            key="metadata.source.file_hash",
+                            match=qm.MatchValue(value=file_hash_now),
+                        ),
+                    ]),
+                    limit=5,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                if not hits:
+                    st.info("Qdrant 內無此 file_hash 的 points。")
+                else:
+                    rows = []
+                    for h in hits:
+                        loc = h.payload.get("metadata", {}).get("location", {})
+                        sysi = h.payload.get("sys_info", {})
+                        rows.append({
+                            "id": str(h.id)[:8] + "…",
+                            "page": loc.get("page"),
+                            "section": loc.get("section_idx"),
+                            "chunk": loc.get("chunk_idx"),
+                            "ingestion_time": sysi.get("ingestion_time"),
+                            "review_status": sysi.get("review_status"),
+                        })
+                    st.dataframe(rows, use_container_width=True, hide_index=True)
+            except Exception as e:
+                st.error(f"查詢失敗：\n```\n{e}\n```")
+
+
+# --- 分頁 6：檢索測試 ---
+with tab_search:
+    st.subheader("檢索測試（dense / sparse / hybrid 三欄並排）")
+    st.caption(
+        "對已寫入 Qdrant 的向量做語意檢索。比較三種模式對術語 / 案場名 / 工法名的回收差異。"
+        "點「📂 跳回該檔該頁」會切到 Tab 1 對應檔案頁面肉眼驗證 citation。"
+    )
+
+    if not HAS_QDRANT:
+        st.error("qdrant-client 未安裝：`pip install qdrant-client`")
+        st.stop()
+
+    # 共用 cache 的 client
+    try:
+        s_client = get_qdrant_client(qdrant_url, qdrant_api_key)
+        _ = s_client.get_collections()
+    except Exception as e:
+        st.error(f"Qdrant 連線失敗：\n```\n{e}\n```")
+        st.stop()
+
+    if not s_client.collection_exists(qdrant_collection_name):
+        st.warning(f"Collection `{qdrant_collection_name}` 不存在，請先到 Tab 5 建立。")
+        st.stop()
+
+    s_total = get_collection_total(s_client, qdrant_collection_name)
+    if s_total == 0:
+        st.warning("Collection 內沒有 points，請先到 Tab 5 ingest 一份檔案。")
+        st.stop()
+    st.caption(f"Collection `{qdrant_collection_name}` 目前共 **{s_total}** points")
+
+    # === 控制列 ===
+    ctrl_cols = st.columns([4, 1, 1])
+    with ctrl_cols[0]:
+        s_query = st.text_input(
+            "Query",
+            key="search_query_input",
+            placeholder="例如：勤美璞真新洲美的機電廠商是哪一家？",
+        )
+    with ctrl_cols[1]:
+        s_top_k = st.number_input(
+            "Top-K", min_value=1, max_value=50, value=10, step=1,
+            key="search_top_k",
+        )
+    with ctrl_cols[2]:
+        st.markdown("&nbsp;", unsafe_allow_html=True)  # 對齊
+        s_run = st.button(
+            "🔍 搜尋", type="primary", use_container_width=True, key="search_run",
+        )
+
+    # === Filter ===
+    s_project_options = sorted({
+        split_key_parts(fk)[0]
+        for fk in file_keys
+        if len(split_key_parts(fk)) > 1
+    })
+    s_projects = st.multiselect(
+        "（選填）只搜這些建案", options=s_project_options, default=[],
+        key="search_filter_projects",
+        help="留空 = 搜整個 collection。多選用 OR。",
+    )
+
+    s_filter = None
+    if s_projects:
+        s_filter = qm.Filter(must=[
+            qm.FieldCondition(
+                key="metadata.source.project_name",
+                match=qm.MatchAny(any=list(s_projects)),
+            ),
+        ])
+
+    # === 執行檢索 ===
+    if s_run and s_query.strip():
+        try:
+            s_embedder = load_embedder(
+                st.session_state.get("embed_model", EMBEDDING_MODEL),
+                st.session_state.get("embed_fp16", True),
+            )
+        except Exception as e:
+            st.error(f"模型載入失敗：\n```\n{e}\n```")
+            st.stop()
+
+        with st.spinner("Encode query + 三種模式檢索中..."):
+            t0 = time.time()
+            q_dense, q_sparse = encode_query(s_embedder, s_query.strip())
+            t_encode = time.time() - t0
+
+            modes_result = {}
+            for label, runner in [
+                ("dense", lambda: search_dense(s_client, qdrant_collection_name, q_dense, int(s_top_k), s_filter)),
+                ("sparse", lambda: search_sparse(s_client, qdrant_collection_name, q_sparse, int(s_top_k), s_filter)),
+                ("hybrid", lambda: search_hybrid(s_client, qdrant_collection_name, q_dense, q_sparse, int(s_top_k), s_filter)),
+            ]:
+                ts = time.time()
+                try:
+                    hits = runner()
+                    err = None
+                except Exception as e:
+                    hits = []
+                    err = str(e)
+                modes_result[label] = {
+                    "hits": hits,
+                    "elapsed": time.time() - ts,
+                    "error": err,
+                }
+
+        st.session_state["_search_result"] = {
+            "query": s_query.strip(),
+            "t_encode": t_encode,
+            "modes": modes_result,
+        }
+
+    # === 結果渲染 ===
+    sr = st.session_state.get("_search_result")
+    if sr:
+        st.markdown(f"**Query**：`{sr['query']}` · encode {sr['t_encode']*1000:.0f} ms")
+
+        result_cols = st.columns(3)
+        mode_titles = [
+            ("dense", "🟦 Dense（語意 / bge-m3 dense）"),
+            ("sparse", "🟧 Sparse（詞彙 / bge-m3 sparse）"),
+            ("hybrid", "🟪 Hybrid（RRF 融合）"),
+        ]
+        for col, (key, title) in zip(result_cols, mode_titles):
+            with col:
+                info = sr["modes"][key]
+                st.markdown(f"**{title}**")
+                if info["error"]:
+                    st.error(f"檢索失敗：\n```\n{info['error']}\n```")
+                    continue
+                st.caption(f"⏱ {info['elapsed']*1000:.0f} ms · {len(info['hits'])} 筆")
+                if not info["hits"]:
+                    st.info("無結果")
+                    continue
+                for rank, h in enumerate(info["hits"], start=1):
+                    payload = h.payload or {}
+                    src = payload.get("metadata", {}).get("source", {}) or {}
+                    loc = payload.get("metadata", {}).get("location", {}) or {}
+                    content = payload.get("content", {}) or {}
+
+                    project = src.get("project_name", "—")
+                    file_key_hit = src.get("file_key", "")
+                    page_hit = loc.get("page")
+                    headings_flat = loc.get("headings_flat", []) or []
+                    text_preview = (content.get("text", "") or "")[:240]
+                    score = h.score if hasattr(h, "score") else None
+
+                    with st.container(border=True):
+                        head_cols = st.columns([3, 1])
+                        head_cols[0].markdown(
+                            f"**#{rank}** ｜ `{project}` · P{page_hit}"
+                        )
+                        if score is not None:
+                            head_cols[1].markdown(
+                                f"<div style='text-align:right; color:#666;'>"
+                                f"score <code>{score:.4f}</code></div>",
+                                unsafe_allow_html=True,
+                            )
+                        if headings_flat:
+                            st.caption(" › ".join(str(h_) for h_ in headings_flat))
+                        st.caption(f"📄 `{Path(file_key_hit).name}`")
+                        st.markdown(
+                            f"<div style='font-size:0.88em; color:#333; "
+                            f"max-height:160px; overflow:auto; "
+                            f"background:#f7f7f8; padding:8px; border-radius:4px;'>"
+                            f"{text_preview.replace('<', '&lt;').replace('>', '&gt;')}"
+                            f"{'…' if len(content.get('text','') or '') > 240 else ''}"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+                        jump_key = f"jump_{key}_{rank}_{h.id}"
+                        if (
+                            file_key_hit
+                            and file_key_hit in file_keys
+                            and page_hit
+                            and st.button(
+                                "📂 跳回該檔該頁",
+                                key=jump_key,
+                                use_container_width=True,
+                            )
+                        ):
+                            st.session_state["sidebar_file_selectbox"] = file_key_hit
+                            st.session_state["_pending_page_idx"] = max(0, int(page_hit) - 1)
+                            st.rerun()

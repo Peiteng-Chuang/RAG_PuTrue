@@ -1,0 +1,101 @@
+{
+  "version": "1.0",
+  "file_key": "勤美之真\\1131119_台中二期-機電銷講簡報.pptx",
+  "file_hash": "8c938bc9c1214de7227309afa3f8c890",
+  "review_status": "processing",
+  "reviewer": "",
+  "reviewed_at": null,
+  "custom_labels": {
+    "document": [
+      {
+        "key": "project",
+        "value": "勤美之真"
+      }
+    ],
+    "pages": {}
+  },
+  "split_settings": {
+    "mode": "delimiter",
+    "delim": "\\n"
+  },
+  "delete_history": [
+    {
+      "page_idx": 1,
+      "page_num": 2,
+      "md_path": "1131119_台中二期-機電銷講簡報_image/1131119_台中二期-機電銷講簡報_p2__page_0_Picture_0.jpeg",
+      "removed_line": "![1131119_台中二期-機電銷講簡報_p2__page_0_Picture_0.jpeg](1131119_台中二期-機電銷講簡報_image/1131119_台中二期-機電銷講簡報_p2__page_0_Picture_0.jpeg)\n",
+      "line_offset": 30,
+      "abs_path": "C:\\project_file\\RAG_PuTrue\\mkdata\\1131119_台中二期-機電銷講簡報_image\\1131119_台中二期-機電銷講簡報_p2__page_0_Picture_0.jpeg",
+      "trash_path": "_md_trash\\1131119_台中二期-機電銷講簡報\\1131119_台中二期-機電銷講簡報_p2__page_0_Picture_0.jpeg",
+      "used_elsewhere": false,
+      "deleted_at": "2026-05-12T07:27:53Z"
+    },
+    {
+      "page_idx": 1,
+      "page_num": 2,
+      "md_path": "1131119_台中二期-機電銷講簡報_image/1131119_台中二期-機電銷講簡報_p2__page_0_Picture_15.jpeg",
+      "removed_line": "![1131119_台中二期-機電銷講簡報_p2__page_0_Picture_15.jpeg](1131119_台中二期-機電銷講簡報_image/1131119_台中二期-機電銷講簡報_p2__page_0_Picture_15.jpeg)\n",
+      "line_offset": 370,
+      "abs_path": "C:\\project_file\\RAG_PuTrue\\mkdata\\1131119_台中二期-機電銷講簡報_image\\1131119_台中二期-機電銷講簡報_p2__page_0_Picture_15.jpeg",
+      "trash_path": "_md_trash\\1131119_台中二期-機電銷講簡報\\1131119_台中二期-機電銷講簡報_p2__page_0_Picture_15.jpeg",
+      "used_elsewhere": false,
+      "deleted_at": "2026-05-12T07:27:55Z"
+    },
+    {
+      "page_idx": 2,
+      "page_num": 3,
+      "md_path": "1131119_台中二期-機電銷講簡報_image/1131119_台中二期-機電銷講簡報_p3__page_0_Picture_1.jpeg",
+      "removed_line": "![1131119_台中二期-機電銷講簡報_p3__page_0_Picture_1.jpeg](1131119_台中二期-機電銷講簡報_image/1131119_台中二期-機電銷講簡報_p3__page_0_Picture_1.jpeg)\n",
+      "line_offset": 33,
+      "abs_path": "C:\\project_file\\RAG_PuTrue\\mkdata\\1131119_台中二期-機電銷講簡報_image\\1131119_台中二期-機電銷講簡報_p3__page_0_Picture_1.jpeg",
+      "trash_path": "_md_trash\\1131119_台中二期-機電銷講簡報\\1131119_台中二期-機電銷講簡報_p3__page_0_Picture_1.jpeg",
+      "used_elsewhere": false,
+      "deleted_at": "2026-05-12T07:38:07Z"
+    },
+    {
+      "page_idx": 2,
+      "page_num": 3,
+      "md_path": "1131119_台中二期-機電銷講簡報_image/1131119_台中二期-機電銷講簡報_p3__page_0_Picture_5.jpeg",
+      "removed_line": "![1131119_台中二期-機電銷講簡報_p3__page_0_Picture_5.jpeg](1131119_台中二期-機電銷講簡報_image/1131119_台中二期-機電銷講簡報_p3__page_0_Picture_5.jpeg)\n",
+      "line_offset": 76,
+      "abs_path": "C:\\project_file\\RAG_PuTrue\\mkdata\\1131119_台中二期-機電銷講簡報_image\\1131119_台中二期-機電銷講簡報_p3__page_0_Picture_5.jpeg",
+      "trash_path": "_md_trash\\1131119_台中二期-機電銷講簡報\\1131119_台中二期-機電銷講簡報_p3__page_0_Picture_5.jpeg",
+      "used_elsewhere": false,
+      "deleted_at": "2026-05-12T07:38:09Z"
+    },
+    {
+      "page_idx": 6,
+      "page_num": 7,
+      "md_path": "1131119_台中二期-機電銷講簡報_image/1131119_台中二期-機電銷講簡報_p7__page_0_Picture_0.jpeg",
+      "removed_line": "![1131119_台中二期-機電銷講簡報_p7__page_0_Picture_0.jpeg](1131119_台中二期-機電銷講簡報_image/1131119_台中二期-機電銷講簡報_p7__page_0_Picture_0.jpeg)\n",
+      "line_offset": 19,
+      "abs_path": "C:\\project_file\\RAG_PuTrue\\mkdata\\1131119_台中二期-機電銷講簡報_image\\1131119_台中二期-機電銷講簡報_p7__page_0_Picture_0.jpeg",
+      "trash_path": "_md_trash\\1131119_台中二期-機電銷講簡報\\1131119_台中二期-機電銷講簡報_p7__page_0_Picture_0.jpeg",
+      "used_elsewhere": false,
+      "deleted_at": "2026-05-12T07:58:53Z"
+    },
+    {
+      "page_idx": 10,
+      "page_num": 11,
+      "md_path": "1131119_台中二期-機電銷講簡報_image/1131119_台中二期-機電銷講簡報_p11__page_0_Picture_1.jpeg",
+      "removed_line": "![1131119_台中二期-機電銷講簡報_p11__page_0_Picture_1.jpeg](1131119_台中二期-機電銷講簡報_image/1131119_台中二期-機電銷講簡報_p11__page_0_Picture_1.jpeg)\n",
+      "line_offset": 27,
+      "abs_path": "C:\\project_file\\RAG_PuTrue\\mkdata\\1131119_台中二期-機電銷講簡報_image\\1131119_台中二期-機電銷講簡報_p11__page_0_Picture_1.jpeg",
+      "trash_path": "_md_trash\\1131119_台中二期-機電銷講簡報\\1131119_台中二期-機電銷講簡報_p11__page_0_Picture_1.jpeg",
+      "used_elsewhere": false,
+      "deleted_at": "2026-05-12T08:01:48Z"
+    },
+    {
+      "page_idx": 10,
+      "page_num": 11,
+      "md_path": "1131119_台中二期-機電銷講簡報_image/1131119_台中二期-機電銷講簡報_p11__page_0_Picture_8.jpeg",
+      "removed_line": "![1131119_台中二期-機電銷講簡報_p11__page_0_Picture_8.jpeg](1131119_台中二期-機電銷講簡報_image/1131119_台中二期-機電銷講簡報_p11__page_0_Picture_8.jpeg)\n",
+      "line_offset": 118,
+      "abs_path": "C:\\project_file\\RAG_PuTrue\\mkdata\\1131119_台中二期-機電銷講簡報_image\\1131119_台中二期-機電銷講簡報_p11__page_0_Picture_8.jpeg",
+      "trash_path": "_md_trash\\1131119_台中二期-機電銷講簡報\\1131119_台中二期-機電銷講簡報_p11__page_0_Picture_8.jpeg",
+      "used_elsewhere": false,
+      "deleted_at": "2026-05-12T08:01:50Z"
+    }
+  ],
+  "disk_dirty": true
+}
