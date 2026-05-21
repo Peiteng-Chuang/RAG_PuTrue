@@ -27,7 +27,11 @@
       "Bash(./venv312/Scripts/streamlit.exe run *)",
       "Bash(./venv312/Scripts/python.exe *)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(git checkout *)",
+      "Bash(git stash *)",
+      "Bash(awk 'NR>1 {print $6, $7, $8}')",
+      "Bash(PYTHONIOENCODING=utf-8 ./venv312/Scripts/python.exe -c ' *)"
     ]
   }
 }

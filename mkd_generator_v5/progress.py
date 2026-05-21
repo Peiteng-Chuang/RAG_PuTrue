@@ -1,0 +1,174 @@
+"""進度回報抽象。ConsoleReporter 為 default；TqdmReporter / SilentReporter 替代。
+
+Pipeline 在 phase 切換、單頁完成時呼叫對應 method；reporter 自行決定怎麼呈現。
+"""
+from __future__ import annotations
+
+import sys
+import time
+from abc import ABC, abstractmethod
+
+
+class ProgressReporter(ABC):
+    """抽象介面。所有 method 不允許 raise（reporter 失敗不可中斷 pipeline）。"""
+
+    @abstractmethod
+    def batch_start(self, total: int) -> None: ...
+
+    @abstractmethod
+    def batch_done(self, ok: int, failed: int) -> None: ...
+
+    @abstractmethod
+    def file_start(self, idx: int, total: int, name: str) -> None: ...
+
+    @abstractmethod
+    def file_done(self, name: str, ok: bool, elapsed: float) -> None: ...
+
+    @abstractmethod
+    def phase(self, phase_name: str, detail: str = "") -> None: ...
+
+    @abstractmethod
+    def page_progress(self, curr: int, total: int, label: str = "") -> None: ...
+
+    @abstractmethod
+    def warning(self, msg: str) -> None: ...
+
+
+class SilentReporter(ProgressReporter):
+    """全靜音。給測試或自動化用。"""
+    def batch_start(self, total): pass
+    def batch_done(self, ok, failed): pass
+    def file_start(self, idx, total, name): pass
+    def file_done(self, name, ok, elapsed): pass
+    def phase(self, phase_name, detail=""): pass
+    def page_progress(self, curr, total, label=""): pass
+    def warning(self, msg): pass
+
+
+class ConsoleReporter(ProgressReporter):
+    """純 print 版。對齊 v4 風格（emoji + 中文），但更勤奮回報。
+
+    page_progress 用 \\r 在同一行更新（terminal-aware）；非 terminal 環境每 10% 才印一次。
+    """
+    def __init__(self, page_progress_step_pct: int = 10):
+        self._page_step = max(1, page_progress_step_pct)
+        self._batch_t0: float | None = None
+        self._file_t0: float | None = None
+        self._last_page_print_pct: int = -1
+        self._is_tty = sys.stdout.isatty()
+
+    def batch_start(self, total):
+        self._batch_t0 = time.time()
+        print(f"🚀 批次開始：共 {total} 個檔案")
+
+    def batch_done(self, ok, failed):
+        elapsed = (time.time() - self._batch_t0) if self._batch_t0 else 0.0
+        print(f"\n🏁 批次完成：成功 {ok} · 失敗 {failed} · 耗時 {elapsed:.1f}s")
+
+    def file_start(self, idx, total, name):
+        self._file_t0 = time.time()
+        self._last_page_print_pct = -1
+        print(f"\n[{idx}/{total}] 📄 {name}")
+
+    def file_done(self, name, ok, elapsed):
+        icon = "✅" if ok else "❌"
+        print(f"  {icon} {elapsed:.1f}s")
+
+    def phase(self, phase_name, detail=""):
+        self._last_page_print_pct = -1
+        suffix = f" — {detail}" if detail else ""
+        print(f"  ▶ {phase_name}{suffix}")
+
+    def page_progress(self, curr, total, label=""):
+        if total <= 0:
+            return
+        pct = int(curr * 100 / total)
+        if self._is_tty:
+            tail = f" {label}" if label else ""
+            sys.stdout.write(f"\r    頁 {curr}/{total} ({pct}%){tail}   ")
+            sys.stdout.flush()
+            if curr == total:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+        else:
+            if pct - self._last_page_print_pct >= self._page_step or curr == total:
+                print(f"    頁 {curr}/{total} ({pct}%)")
+                self._last_page_print_pct = pct
+
+    def warning(self, msg):
+        print(f"  ⚠️  {msg}")
+
+
+class TqdmReporter(ProgressReporter):
+    """tqdm 三層 bar：batch / file_phase / page。需 `pip install tqdm`。
+
+    若 tqdm 未裝，自動 fallback 成 ConsoleReporter（不中斷）。
+    """
+    def __init__(self):
+        try:
+            from tqdm import tqdm  # noqa: F401
+            self._tqdm = tqdm
+            self._fallback: ConsoleReporter | None = None
+        except ImportError:
+            self._tqdm = None
+            self._fallback = ConsoleReporter()
+        self._batch_bar = None
+        self._page_bar = None
+        self._current_file_name: str | None = None
+
+    def _f(self) -> ConsoleReporter | None:
+        return self._fallback
+
+    def batch_start(self, total):
+        if self._f(): return self._f().batch_start(total)
+        self._batch_bar = self._tqdm(total=total, desc="batch", unit="file")
+
+    def batch_done(self, ok, failed):
+        if self._f(): return self._f().batch_done(ok, failed)
+        if self._batch_bar:
+            self._batch_bar.close()
+            self._batch_bar = None
+        print(f"🏁 成功 {ok} · 失敗 {failed}")
+
+    def file_start(self, idx, total, name):
+        if self._f(): return self._f().file_start(idx, total, name)
+        self._current_file_name = name
+        if self._batch_bar:
+            self._batch_bar.set_postfix_str(name[:40])
+
+    def file_done(self, name, ok, elapsed):
+        if self._f(): return self._f().file_done(name, ok, elapsed)
+        if self._page_bar:
+            self._page_bar.close()
+            self._page_bar = None
+        if self._batch_bar:
+            self._batch_bar.update(1)
+
+    def phase(self, phase_name, detail=""):
+        if self._f(): return self._f().phase(phase_name, detail)
+        # 切 phase 時關掉 page bar
+        if self._page_bar:
+            self._page_bar.close()
+            self._page_bar = None
+        if self._batch_bar:
+            tag = f"{self._current_file_name or '?'}|{phase_name}"
+            self._batch_bar.set_postfix_str(tag[:60])
+
+    def page_progress(self, curr, total, label=""):
+        if self._f(): return self._f().page_progress(curr, total, label)
+        if self._page_bar is None:
+            self._page_bar = self._tqdm(
+                total=total, desc="  pages", unit="pg", leave=False,
+            )
+        # 更新 absolute 位置而非增量（呼叫端可能跳號）
+        delta = curr - self._page_bar.n
+        if delta > 0:
+            self._page_bar.update(delta)
+        if curr >= total:
+            self._page_bar.close()
+            self._page_bar = None
+
+    def warning(self, msg):
+        if self._f(): return self._f().warning(msg)
+        if self._tqdm:
+            self._tqdm.write(f"⚠️  {msg}")
