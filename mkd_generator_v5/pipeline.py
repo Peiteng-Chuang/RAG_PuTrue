@@ -19,11 +19,12 @@ from typing import Any
 import fitz
 
 from .page_cache import CachedPage
-from .progress import ProgressReporter, SilentReporter
+from .progress import Phase, ProgressReporter, SilentReporter
 from .strategies import (
     FormatConverter, TemplateFilter, TitleExtractor, TextCleaner,
     ImageExtractor, TriageStrategy, Stitcher,
 )
+from .strategies.marker_post import normalize_marker_headings
 from .types import ExtractContext, PageFragment
 
 fitz.TOOLS.mupdf_display_errors(False)
@@ -90,13 +91,13 @@ class RAGPipeline:
             # Phase 1: convert
             ext = input_path.suffix.lower()
             if self.converter.supports(ext):
-                self.reporter.phase("CONVERTING_FORMAT", input_path.name)
+                self.reporter.phase(Phase.CONVERTING_FORMAT, input_path.name)
                 working_pdf = self.converter.convert(input_path, self.tmp_dir)
             else:
                 working_pdf = input_path
 
             # Phase 2: open + template scan
-            self.reporter.phase("FITZ_SCANNING")
+            self.reporter.phase(Phase.FITZ_SCANNING)
             # R3: fitz.open 獨立 try/except，accurate 錯誤訊息 + 早 return
             try:
                 doc = fitz.open(working_pdf)
@@ -110,7 +111,7 @@ class RAGPipeline:
                 return False
             filter_state = self.template_filter.scan(doc)
             self.reporter.phase(
-                "FITZ_SCAN_DONE",
+                Phase.FITZ_SCAN_DONE,
                 f"banned text={len(filter_state.banned_global_texts)}, "
                 f"banned img={len(filter_state.banned_image_hashes)}",
             )
@@ -140,7 +141,7 @@ class RAGPipeline:
             vector_indices: list[int] = []
             triage_log: list[dict] = []                 # S1: per-page decision log
             total_pages = len(doc)
-            self.reporter.phase("PER_PAGE", f"{total_pages} pages")
+            self.reporter.phase(Phase.PER_PAGE, f"{total_pages} pages")
             for page_idx in range(total_pages):
                 page = CachedPage(doc[page_idx])
                 title_hit = self.title_extractor.extract(page)
@@ -221,7 +222,7 @@ class RAGPipeline:
                         f"{len(vector_indices)} 頁需 Marker 但未提供 converter — 留 placeholder"
                     )
                 else:
-                    self.reporter.phase("MARKER", f"{len(vector_indices)} pages")
+                    self.reporter.phase(Phase.MARKER, f"{len(vector_indices)} pages")
                     self._run_marker_stage(
                         doc, working_pdf, vector_indices, fragments, ctx,
                     )
@@ -239,7 +240,7 @@ class RAGPipeline:
                     self.reporter.warning(f"triage log write failed: {e}")
 
             # Phase 5: stitch
-            self.reporter.phase("STITCHING")
+            self.reporter.phase(Phase.STITCHING)
             self.stitcher.stitch(
                 fragments,
                 meta={
@@ -260,50 +261,12 @@ class RAGPipeline:
             return False
         finally:
             try:
-                self.reporter.phase("CLEANING_UP")
+                self.reporter.phase(Phase.CLEANING_UP)
             except Exception:
                 pass
             self._cleanup()
 
     # ---- internal ----
-
-    @staticmethod
-    def _normalize_marker_headings(text: str) -> str:
-        """把 Marker 輸出的 heading 壓平到 `### / ####`，跟 fast path 對齊。
-
-        階層約定：## = page anchor、### = page_title、#### = subtitle/inline。
-        所以 Marker body 不應出現 ## 或 #；H3+ 都壓到 ####。
-
-        保護區段：fenced code（``` 圍）、pipe table（^|）的行不動。
-        """
-        lines = text.split("\n")
-        out_lines: list[str] = []
-        in_fence = False
-        fence_re = re.compile(r"^```")
-        pipe_re = re.compile(r"^\s*\|")
-        heading_re = re.compile(r"^(#{1,6})\s+(.*)$")
-        for ln in lines:
-            if fence_re.match(ln):
-                in_fence = not in_fence
-                out_lines.append(ln)
-                continue
-            if in_fence or pipe_re.match(ln):
-                out_lines.append(ln)
-                continue
-            m = heading_re.match(ln)
-            if m:
-                hashes, rest = m.group(1), m.group(2)
-                n = len(hashes)
-                if n <= 2:           # #, ## → ###
-                    new = "###"
-                elif n == 3:         # ### → ####
-                    new = "####"
-                else:                # ####, #####, ###### → ####
-                    new = "####"
-                out_lines.append(f"{new} {rest}")
-            else:
-                out_lines.append(ln)
-        return "\n".join(out_lines)
 
     def _resolve_main_title(self, doc, stem: str, n_scan: int = 3) -> str:
         """掃前 n_scan 頁的 title_extractor，取最大字體 page_title 當主標。
@@ -489,7 +452,7 @@ class RAGPipeline:
                     page_text = re.sub(r"\n{3,}", "\n\n", page_text)
 
         # P3: 把剩餘的 # / ## / ### 階層 normalize 成 ### / ####，跟 fast path 對齊
-        page_text = self._normalize_marker_headings(page_text)
+        page_text = normalize_marker_headings(page_text)
 
         # 替換 placeholder
         frag.body = frag.body.replace(frag.marker_placeholder, f"\n{page_text}\n", 1)

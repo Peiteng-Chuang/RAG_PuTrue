@@ -7,6 +7,23 @@ from __future__ import annotations
 import sys
 import time
 from abc import ABC, abstractmethod
+from enum import StrEnum
+
+
+class Phase(StrEnum):
+    """A5：pipeline phase 名稱列舉。
+
+    StrEnum 自動是 str subclass，傳給 reporter.phase() 跟過去傳 string 完全相容；
+    使用 enum 讓 IDE / type checker 抓 typo。`_DONE` 結尾的視為「事件標記」，
+    _PhaseTimer 不會把它算成新 phase。
+    """
+    CONVERTING_FORMAT = "CONVERTING_FORMAT"
+    FITZ_SCANNING = "FITZ_SCANNING"
+    FITZ_SCAN_DONE = "FITZ_SCAN_DONE"
+    PER_PAGE = "PER_PAGE"
+    MARKER = "MARKER"
+    STITCHING = "STITCHING"
+    CLEANING_UP = "CLEANING_UP"
 
 
 class ProgressReporter(ABC):

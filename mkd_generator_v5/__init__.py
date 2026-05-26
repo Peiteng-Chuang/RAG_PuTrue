@@ -43,25 +43,41 @@ def default_pipeline(
     triage: TriageStrategy | None = None,
     enable_triage_log: bool = True,
     marker_pool_workers: int = 0,
+    backfill_title_from_marker: bool = True,
+    converter: FormatConverter | None = None,
+    template_filter: TemplateFilter | None = None,
+    title_extractor: TitleExtractor | None = None,
+    text_cleaner: TextCleaner | None = None,
+    image_extractor: ImageExtractor | None = None,
+    stitcher: Stitcher | None = None,
 ):
     """v5 預設配置：HierarchicalTitleExtractor + B-surgical cleaner + 統一圖檔命名。
 
-    triage：可注入自訂策略，預設 DrawingCountTriage(200)
-    enable_triage_log：寫 per-file _triage_log/{stem}.jsonl，方便事後 audit
-    marker_pool_workers：S3，>0 → process pool 平行跑 Marker，**4090 上 max=2 安全**
+    A3：所有 strategy 都可由 caller 直接覆蓋（傳 instance）。預設 None → 用工廠預設。
+
+    Args:
+        marker_converter: marker.PdfConverter instance；None 則跑 fast path only
+        reporter: ProgressReporter；None → ConsoleReporter()
+        triage: TriageStrategy；None → DrawingCountTriage(200)
+        enable_triage_log: 寫 per-file _triage_log/{stem}.jsonl
+        marker_pool_workers: S3，>0 → process pool 跑 Marker（4090 max=2 安全）
+        backfill_title_from_marker: Marker 路徑頁是否補抓 H3 為 frag.title（預設開）
+        converter / template_filter / title_extractor / text_cleaner / image_extractor / stitcher:
+            傳 instance 直接覆蓋預設 strategy；None → 用工廠預設
     """
     return RAGPipeline(
-        converter=LibreOfficeConverter(),
-        template_filter=PositionalTemplateFilter(),
-        title_extractor=HierarchicalTitleExtractor(),
-        text_cleaner=SpanLevelTextCleaner(),
-        image_extractor=HashNamedImageExtractor(),
+        converter=converter or LibreOfficeConverter(),
+        template_filter=template_filter or PositionalTemplateFilter(),
+        title_extractor=title_extractor or HierarchicalTitleExtractor(),
+        text_cleaner=text_cleaner or SpanLevelTextCleaner(),
+        image_extractor=image_extractor or HashNamedImageExtractor(),
         triage=triage or DrawingCountTriage(threshold=200),
-        stitcher=PageFragmentStitcher(),
+        stitcher=stitcher or PageFragmentStitcher(),
         marker_converter=marker_converter,
         reporter=reporter or ConsoleReporter(),
         enable_triage_log=enable_triage_log,
         marker_pool_workers=marker_pool_workers,
+        backfill_title_from_marker=backfill_title_from_marker,
     )
 
 

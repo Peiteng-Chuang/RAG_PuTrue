@@ -142,6 +142,54 @@ class HierarchicalTitleExtractor(TitleExtractor):
         self.inline_heading_min_size_gap = inline_heading_min_size_gap
 
     def extract(self, page) -> TitleHit | None:
+        """A2：orchestrator — 串接四個 step。每個 step 可單獨單元測試。
+
+        1. _collect_candidates: 從 page 取出 candidate spans
+        2. _pick_page_title: 從 candidates 選 page_title（含小字 → 續前頁 fallback）
+        3. _pick_subtitle: cover page 額外抓 subtitle（內頁回 None）
+        4. _pick_inline_headings: 比 body 大且非 page_title/subtitle 的 spans
+        """
+        candidates = self._collect_candidates(page)
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: (-x["size"], x["y0"]))
+
+        page_idx = getattr(page, "number", -1)
+        is_cover = page_idx == 0
+
+        page_title = self._pick_page_title(candidates, is_cover)
+        if page_title is None:
+            return None
+
+        # 續前頁 fallback：bbox=None 表合成 title，無 subtitle / inline 概念
+        if page_title.bbox is None:
+            return TitleHit(
+                text=page_title.text, bbox=None,
+                headings=PageHeadings(page_title=page_title),
+            )
+
+        subtitle = self._pick_subtitle(candidates, page_title, is_cover)
+
+        taken_bboxes: set = {page_title.bbox}
+        if subtitle and subtitle.bbox:
+            taken_bboxes.add(subtitle.bbox)
+        inline_headings = self._pick_inline_headings(candidates, taken_bboxes)
+
+        ph = PageHeadings(
+            page_title=page_title, subtitle=subtitle,
+            inline_headings=inline_headings,
+        )
+        return TitleHit(text=page_title.text, bbox=page_title.bbox, headings=ph)
+
+    # ---- internal: 四個 step ----
+
+    def _collect_candidates(self, page) -> list[dict]:
+        """Step 1：從 page 取出 candidate span dict list。
+
+        過濾：太短 / 純數字 / 頁碼 pattern / 列點 bullet / 寬度 ≥95% 且 ≥30 字（body 段落）。
+        Exception → 印 stderr warning 並回空 list。
+        """
         try:
             page_w = page.rect.width
             blocks = page.get_text("dict")["blocks"]
@@ -152,7 +200,7 @@ class HierarchicalTitleExtractor(TitleExtractor):
                 f"page.get_text failed ({type(e).__name__}: {e}) — 跳過該頁 title",
                 file=sys.stderr, flush=True,
             )
-            return None
+            return []
 
         candidates: list[dict] = []
         for b in blocks:
@@ -181,76 +229,92 @@ class HierarchicalTitleExtractor(TitleExtractor):
                         "y0": bbox[1],
                         "bbox": bbox,
                     })
+        return candidates
 
+    def _pick_page_title(
+        self, candidates: list[dict], is_cover: bool,
+    ) -> HeadingSpan | None:
+        """Step 2：候選排序後選最大字體 cluster 當 page_title。
+
+        - 整頁字都很小（< small_size_threshold）→ 回「續前頁內容」(bbox=None)
+        - non-cover 且 max_group 有多個 → 回 None（避免目錄頁誤抓）
+        - cover 多個 max_group → 取 y0 最上面那個
+        """
         if not candidates:
             return None
-
-        candidates.sort(key=lambda x: (-x["size"], x["y0"]))
         max_size = candidates[0]["size"]
 
-        # 整頁字都很小 → 視為續頁
+        # 整頁字都很小 → 續前頁
         if max_size < self.small_size_threshold:
-            ph = PageHeadings(
-                page_title=HeadingSpan(
-                    text=self.continuation_text, bbox=None, size=max_size,
-                    level=1, y0=0.0,
-                )
+            return HeadingSpan(
+                text=self.continuation_text, bbox=None, size=max_size,
+                level=1, y0=0.0,
             )
-            return TitleHit(text=self.continuation_text, bbox=None, headings=ph)
 
-        max_group = [c for c in candidates if abs(c["size"] - max_size) < self.size_tolerance]
-        is_cover = getattr(page, "number", -1) == 0
-
-        # non-cover 多 candidate → 沿用 v4 行為（None，避免目錄頁誤抓）
+        max_group = [
+            c for c in candidates
+            if abs(c["size"] - max_size) < self.size_tolerance
+        ]
         if not is_cover and len(max_group) > 1:
             return None
 
-        page_title_c = (
+        picked = (
             min(max_group, key=lambda c: c["y0"]) if is_cover else max_group[0]
         )
-        page_title = HeadingSpan(
-            text=page_title_c["text"],
-            bbox=page_title_c["bbox"],
-            size=page_title_c["size"],
-            level=1,
-            y0=page_title_c["y0"],
+        return HeadingSpan(
+            text=picked["text"], bbox=picked["bbox"],
+            size=picked["size"], level=1, y0=picked["y0"],
         )
 
-        # subtitle 只在 cover page 偵測（內頁的 subtitle 概念不明確；body 第一行容易誤判）
-        subtitle: HeadingSpan | None = None
-        if is_cover:
-            smaller = [c for c in candidates if c["size"] < max_size - self.size_tolerance]
-            if smaller:
-                second_size = smaller[0]["size"]
-                second_group = [
-                    c for c in smaller
-                    if abs(c["size"] - second_size) < self.size_tolerance
-                ]
-                page_title_y1 = page_title_c["bbox"][3]
-                for c in second_group:
-                    gap = c["y0"] - page_title_y1
-                    if 0 <= gap <= second_size * self.subtitle_max_vertical_gap_ratio:
-                        subtitle = HeadingSpan(
-                            text=c["text"], bbox=c["bbox"],
-                            size=c["size"], level=2, y0=c["y0"],
-                        )
-                        break
+    def _pick_subtitle(
+        self, candidates: list[dict], page_title: HeadingSpan, is_cover: bool,
+    ) -> HeadingSpan | None:
+        """Step 3：subtitle 只在 cover page 偵測（內頁的 subtitle 概念不明確；
+        body 第一行容易誤判）。需在 page_title 下方 size*ratio 之內。
+        """
+        if not is_cover or page_title.bbox is None:
+            return None
+        max_size = page_title.size
+        smaller = [
+            c for c in candidates if c["size"] < max_size - self.size_tolerance
+        ]
+        if not smaller:
+            return None
+        second_size = smaller[0]["size"]
+        second_group = [
+            c for c in smaller
+            if abs(c["size"] - second_size) < self.size_tolerance
+        ]
+        page_title_y1 = page_title.bbox[3]
+        for c in second_group:
+            gap = c["y0"] - page_title_y1
+            if 0 <= gap <= second_size * self.subtitle_max_vertical_gap_ratio:
+                return HeadingSpan(
+                    text=c["text"], bbox=c["bbox"],
+                    size=c["size"], level=2, y0=c["y0"],
+                )
+        return None
 
-        # inline_headings：比 body (mode size) 大但不是 page_title/subtitle 的 spans
-        taken_bboxes = set()
-        if page_title.bbox:
-            taken_bboxes.add(page_title.bbox)
-        if subtitle and subtitle.bbox:
-            taken_bboxes.add(subtitle.bbox)
+    def _pick_inline_headings(
+        self, candidates: list[dict], taken_bboxes: set,
+    ) -> list[HeadingSpan]:
+        """Step 4：比 body (推估 size) 大但不是 page_title/subtitle 的 span。
 
-        # body_size 推估：出現 ≥2 次的最小 size（避免 mode tie 挑到 heading）
+        body_size 推估：出現 ≥2 次的最小 size（避免 Counter.most_common tie
+        挑到 heading 而非 body）。fallback 用 min(size)。
+        """
+        if not candidates:
+            return []
         size_counts = Counter(c["size"] for c in candidates)
         repeated = [s for s, n in size_counts.items() if n >= 2]
-        body_size = min(repeated) if repeated else min(c["size"] for c in candidates)
+        body_size = (
+            min(repeated) if repeated else min(c["size"] for c in candidates)
+        )
 
         inline_headings: list[HeadingSpan] = []
+        taken = set(taken_bboxes)
         for c in candidates:
-            if c["bbox"] in taken_bboxes:
+            if c["bbox"] in taken:
                 continue
             if c["size"] <= body_size + self.inline_heading_min_size_gap:
                 continue
@@ -258,13 +322,8 @@ class HierarchicalTitleExtractor(TitleExtractor):
                 text=c["text"], bbox=c["bbox"],
                 size=c["size"], level=4, y0=c["y0"],
             ))
-            taken_bboxes.add(c["bbox"])
+            taken.add(c["bbox"])
             if len(inline_headings) >= self.max_inline_headings:
                 break
         inline_headings.sort(key=lambda h: h.y0)
-
-        ph = PageHeadings(
-            page_title=page_title, subtitle=subtitle,
-            inline_headings=inline_headings,
-        )
-        return TitleHit(text=page_title.text, bbox=page_title.bbox, headings=ph)
+        return inline_headings
