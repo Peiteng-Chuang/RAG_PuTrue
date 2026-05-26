@@ -25,6 +25,18 @@ import time
 from pathlib import Path
 from typing import Any
 
+# 確保 stdout/stderr 用 UTF-8（同 run_v5.py），避免 emoji 在 cp950 console crash
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+# 對齊 v4 / run_v5.py：torch first-time import 2-3s（典型）或更久（冷啟動），
+# 預先在程式啟動完成。否則延遲發生在 bench 跑檔階段，會誤入時間量測造成 baseline 失真。
+print("[啟動] 載入 PyTorch 中...", flush=True)
+import torch  # noqa: F401
+print("[啟動] PyTorch 已就緒", flush=True)
+
 # S2 註記：若想用 expandable_segments（PyTorch 2.1+），在 shell 自己 export；
 # 預設不在程式內主動設，避免老 PyTorch / driver 組合 silent crash。
 

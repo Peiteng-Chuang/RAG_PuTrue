@@ -24,20 +24,41 @@ import argparse
 import sys
 from pathlib import Path
 
+# 確保 stdout/stderr 用 UTF-8，避免 emoji 在 cp950 console 或 pipe 環境 crash
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+# 對齊 v4 (mkd_generator_v4.py:6)：torch first-time import 在這台機器 2-3 秒，
+# 冷啟動或慢磁碟可能 30s-2min（PyTorch 2.11 載入 quantization → ao → fx.passes 等大量子模組）。
+# 若 torch 不在程式啟動 top-level 載入，會延遲到 _build_marker_converter() 內
+# 由 marker 內部觸發，發生在「📋 掃描結果」訊息之後，使用者誤判為 marker 卡住。
+# 預先 import 將等待移到程式啟動瞬間並先報訊號，與 v4 行為對齊。
+print("[啟動] 載入 PyTorch 中...（typically 2-15s，冷啟動可能更久，請耐心等候）",
+      flush=True)
+import torch  # noqa: F401（不直接使用，純為觸發模組載入）
+print("[啟動] PyTorch 已就緒", flush=True)
+
 # S2 註記：若想用 expandable_segments（PyTorch 2.1+），在 shell 自己 export：
 #   PowerShell: $env:PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
 #   Bash:       export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # 預設不主動設，避免老 PyTorch / driver 組合 silent crash。
 
 
-DEFAULT_DATA_ROOT = r"D:/璞真RAG資料夾/12.個案銷講資料"
+DEFAULT_DATA_ROOT = r"C:/project_file/RAG_PuTrue/璞真RAG_rawdata"
 DEFAULT_OUTPUT_ROOT = "./mkdata"
 
 
 def _build_marker_converter():
-    """⚠️ Hang 不會走進 except；用 `python -v` 看 import trace 或 PYTHONFAULTHANDLER=1 看 native crash。"""
+    """Marker 套件 import + 模型 weights 載入。
+
+    torch 已在程式 top-level 預先 import，所以本函式 [1/2] 階段只剩 marker 自己的
+    submodule（Surya / OCR / processors），通常 5-15 秒。[2/2] model weights 載入
+    視磁碟 I/O 與 CUDA cache 狀態，30 秒至數分鐘。
+    """
     import traceback
-    print("🔧 [1/2] 載入 Marker 套件中（首次 import 含 Surya/OCR 子模組，需數秒~30+ 秒）...",
+    print("[1/2] 載入 Marker 套件 submodule 中（torch 已預先載入，此段 5-15s）...",
           flush=True)
     try:
         from marker.converters.pdf import PdfConverter
@@ -50,7 +71,7 @@ def _build_marker_converter():
         print(f"⚠️ Marker import 例外（非 ImportError）。CAD 頁將留 placeholder。")
         traceback.print_exc()
         return None
-    print("🔧 [2/2] 載入 Marker 模型 weights（首次需數十秒到幾分鐘，後續較快）...",
+    print("[2/2] 載入 Marker 模型 weights（首次 30s-2min，後續較快；請勿中斷）...",
           flush=True)
     try:
         return PdfConverter(artifact_dict=create_model_dict())
