@@ -35,21 +35,28 @@ DEFAULT_OUTPUT_ROOT = "./mkdata"
 
 
 def _build_marker_converter():
-    # 拆兩段 print：import 跟 model build 各有獨立等待期，每段都先報訊號
+    """⚠️ Hang 不會走進 except；用 `python -v` 看 import trace 或 PYTHONFAULTHANDLER=1 看 native crash。"""
+    import traceback
     print("🔧 [1/2] 載入 Marker 套件中（首次 import 含 Surya/OCR 子模組，需數秒~30+ 秒）...",
           flush=True)
     try:
         from marker.converters.pdf import PdfConverter
         from marker.models import create_model_dict
     except ImportError as e:
-        print(f"⚠️ Marker 套件未裝（{e}）。CAD 頁將留 placeholder。")
+        print(f"⚠️ Marker 套件未裝。CAD 頁將留 placeholder。")
+        traceback.print_exc()
+        return None
+    except Exception as e:
+        print(f"⚠️ Marker import 例外（非 ImportError）。CAD 頁將留 placeholder。")
+        traceback.print_exc()
         return None
     print("🔧 [2/2] 載入 Marker 模型 weights（首次需數十秒到幾分鐘，後續較快）...",
           flush=True)
     try:
         return PdfConverter(artifact_dict=create_model_dict())
     except Exception as e:
-        print(f"⚠️ Marker 模型載入失敗（{e}）。CAD 頁將留 placeholder。")
+        print(f"⚠️ Marker 模型載入失敗。CAD 頁將留 placeholder。")
+        traceback.print_exc()
         return None
 
 

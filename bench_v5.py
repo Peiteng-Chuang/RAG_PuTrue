@@ -233,9 +233,11 @@ def main() -> int:
             if not ok:
                 failed.append(str(pdf))
         except Exception as e:
+            import traceback
             elapsed = time.perf_counter() - t_file
             reporter.file_done(pdf.name, ok=False, elapsed=elapsed)
             print(f"✗ ({e})")
+            traceback.print_exc()
             failed.append(str(pdf))
     reporter.batch_done(len(pdfs) - len(failed), len(failed))
 

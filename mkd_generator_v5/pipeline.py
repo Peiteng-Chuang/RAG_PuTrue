@@ -112,7 +112,9 @@ class RAGPipeline:
             try:
                 self.triage.prepare(doc)
             except Exception as e:
+                import traceback
                 self.reporter.warning(f"triage.prepare failed: {e}")
+                traceback.print_exc()
 
             # Phase 3: per-page triage + fast path
             ctx = ExtractContext(
@@ -222,7 +224,9 @@ class RAGPipeline:
             return True
 
         except Exception as e:
+            import traceback
             self.reporter.warning(f"pipeline failed for {input_path.name}: {e}")
+            traceback.print_exc()
             return False
         finally:
             try:
@@ -349,7 +353,9 @@ class RAGPipeline:
                     i + 1, len(vector_indices), label=f"P{page_idx + 1}",
                 )
             except Exception as e:
+                import traceback
                 self.reporter.warning(f"marker page {page_idx + 1} failed: {e}")
+                traceback.print_exc()
 
     def _run_marker_pool(
         self, doc, vector_indices, fragments, ctx,
@@ -376,7 +382,9 @@ class RAGPipeline:
                 v_doc.close()
                 tmp_paths.append((page_idx, tmp_pdf))
             except Exception as e:
+                import traceback
                 self.reporter.warning(f"marker pool extract P{page_idx + 1}: {e}")
+                traceback.print_exc()
         if not tmp_paths:
             return
 
@@ -385,7 +393,9 @@ class RAGPipeline:
             with MarkerPool(max_workers=self.marker_pool_workers) as pool:
                 results = pool.process_batch([str(p) for _, p in tmp_paths])
         except Exception as e:
+            import traceback
             self.reporter.warning(f"marker pool 失敗 ({e})；回退 sequential")
+            traceback.print_exc()
             self._run_marker_sequential(doc, vector_indices, fragments, ctx)
             return
 
@@ -402,7 +412,9 @@ class RAGPipeline:
                 images = deserialize_images(result.get("images", {}))
                 self._apply_marker_result(page_idx, page_text, images, fragments, ctx)
             except Exception as e:
+                import traceback
                 self.reporter.warning(f"marker pool post P{page_idx + 1}: {e}")
+                traceback.print_exc()
             self.reporter.page_progress(
                 i + 1, len(tmp_paths), label=f"P{page_idx + 1}",
             )
