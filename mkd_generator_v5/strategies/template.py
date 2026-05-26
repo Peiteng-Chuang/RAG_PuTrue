@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import sys
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -84,12 +85,25 @@ class PositionalTemplateFilter(TemplateFilter):
             prev_page_texts = curr_page_texts
 
             # --- 圖片 ---
+            # bad xref 容錯：壞 xref 在 cache 寫 None sentinel，下游 image extractor 看到 None
+            # 即知該 xref 已驗證為壞、直接 skip，不會再重試 extract_image
             seen_hashes_on_page: set[str] = set()
             for xref in _visible_image_xrefs_on_page(page):
                 if xref not in state.xref_to_hash_cache:
-                    img_data = doc.extract_image(xref)
-                    state.xref_to_hash_cache[xref] = hashlib.md5(img_data["image"]).hexdigest()
+                    try:
+                        img_data = doc.extract_image(xref)
+                        state.xref_to_hash_cache[xref] = hashlib.md5(img_data["image"]).hexdigest()
+                    except (ValueError, RuntimeError) as e:
+                        print(
+                            f"[WARN] template scan: bad xref={xref} on page {page_idx + 1} "
+                            f"({type(e).__name__}: {e}) — 標記跳過",
+                            file=sys.stderr, flush=True,
+                        )
+                        state.xref_to_hash_cache[xref] = None
+                        continue
                 h = state.xref_to_hash_cache[xref]
+                if h is None:
+                    continue  # 之前已標記為壞 xref
                 if h in seen_hashes_on_page:
                     continue
                 seen_hashes_on_page.add(h)

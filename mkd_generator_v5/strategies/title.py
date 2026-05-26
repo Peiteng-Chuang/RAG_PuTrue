@@ -6,10 +6,16 @@
 from __future__ import annotations
 
 import re
+import sys
 from abc import ABC, abstractmethod
 from collections import Counter
 
 from ..types import HeadingSpan, PageHeadings, TitleHit
+
+
+# R6：縮窄 except 範圍。預期的 PyMuPDF 解析錯誤 → 印 stderr warning 並 return None；
+# 其他 exception（程式 bug 等）不抓，往上拋。
+_TITLE_PARSE_ERRORS = (ValueError, RuntimeError, KeyError, TypeError)
 
 
 class TitleExtractor(ABC):
@@ -77,7 +83,13 @@ class FontSizeTitleExtractor(TitleExtractor):
                 return TitleHit(text=self.continuation_text, bbox=None)
 
             return TitleHit(text=candidates[0]["text"], bbox=candidates[0]["bbox"])
-        except Exception:
+        except _TITLE_PARSE_ERRORS as e:
+            page_idx = getattr(page, "number", -1)
+            print(
+                f"[WARN] FontSizeTitleExtractor.extract P{page_idx + 1} failed "
+                f"({type(e).__name__}: {e}) — 跳過該頁 title",
+                file=sys.stderr, flush=True,
+            )
             return None
 
 
@@ -133,7 +145,13 @@ class HierarchicalTitleExtractor(TitleExtractor):
         try:
             page_w = page.rect.width
             blocks = page.get_text("dict")["blocks"]
-        except Exception:
+        except _TITLE_PARSE_ERRORS as e:
+            page_idx = getattr(page, "number", -1)
+            print(
+                f"[WARN] HierarchicalTitleExtractor.extract P{page_idx + 1} "
+                f"page.get_text failed ({type(e).__name__}: {e}) — 跳過該頁 title",
+                file=sys.stderr, flush=True,
+            )
             return None
 
         candidates: list[dict] = []

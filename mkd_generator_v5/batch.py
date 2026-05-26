@@ -24,9 +24,15 @@ _worker_output_root: Path | None = None
 
 
 def _file_worker_init(output_root_str: str, no_marker: bool) -> None:
-    """S5：file worker 啟動時 build pipeline 一次（含 marker），持久於 process 生命週期。"""
+    """S5：file worker 啟動時 build pipeline 一次（含 marker），持久於 process 生命週期。
+
+    R1：整個 init 流程包 try/except。Marker build 失敗 → fallback 無 marker pipeline，
+    印 stderr warning，不 raise（raise 會讓 ProcessPoolExecutor BrokenProcessPool 整個 pool 跪）。
+    default_pipeline build 失敗才 _worker_pipeline = None sentinel，run 時 short-circuit return error。
+    """
     global _worker_pipeline, _worker_output_root
-    from mkd_generator_v5 import default_pipeline  # 延遲 import，避免 main 過早
+    import sys as _sys
+    import traceback as _tb
 
     marker = None
     if not no_marker:
@@ -34,19 +40,45 @@ def _file_worker_init(output_root_str: str, no_marker: bool) -> None:
             from marker.converters.pdf import PdfConverter
             from marker.models import create_model_dict
             marker = PdfConverter(artifact_dict=create_model_dict())
-        except Exception:
+        except Exception as e:
+            print(
+                f"[WARN] worker_init: marker build 失敗，回退無 marker pipeline "
+                f"({type(e).__name__}: {e})",
+                file=_sys.stderr, flush=True,
+            )
+            _tb.print_exc(file=_sys.stderr)
             marker = None
 
-    _worker_pipeline = default_pipeline(
-        marker_converter=marker, reporter=SilentReporter(),
-    )
-    _worker_output_root = Path(output_root_str)
+    try:
+        from mkd_generator_v5 import default_pipeline
+        _worker_pipeline = default_pipeline(
+            marker_converter=marker, reporter=SilentReporter(),
+        )
+        _worker_output_root = Path(output_root_str)
+    except Exception as e:
+        print(
+            f"[ERROR] worker_init: default_pipeline build 失敗，"
+            f"worker 進入 sentinel 模式 ({type(e).__name__}: {e})",
+            file=_sys.stderr, flush=True,
+        )
+        _tb.print_exc(file=_sys.stderr)
+        _worker_pipeline = None
+        _worker_output_root = Path(output_root_str)
 
 
 def _file_worker_run(file_path_str: str) -> dict:
-    """Worker：跑單檔 pipeline，回 dict 給主程式 aggregate。"""
+    """Worker：跑單檔 pipeline，回 dict 給主程式 aggregate。
+
+    R1：worker init 進入 sentinel (_worker_pipeline is None) 時直接 return failure，
+    避免每檔都跳 AttributeError 噴一堆無用 traceback。
+    """
     global _worker_pipeline, _worker_output_root
     t0 = time.time()
+    if _worker_pipeline is None:
+        return {
+            "file": file_path_str, "ok": False,
+            "elapsed": 0.0, "error": "worker_init failed; pipeline unavailable",
+        }
     try:
         ok = _worker_pipeline.run(Path(file_path_str), _worker_output_root)
         return {"file": file_path_str, "ok": ok, "elapsed": time.time() - t0}
@@ -280,40 +312,67 @@ class BatchProcessor:
             return ok, failed
 
         # Step 2: parallel
+        # R1：pool 建立 / 跑檔過程任何 BrokenProcessPool / 其他 fatal exception，
+        # fallback 到 sequential process_all。pool 在 with-block 已開始派工的 future
+        # 結果無法救，但至少剩下的 file 不會 lost。
         ctx = mp.get_context("spawn")
-        with ProcessPoolExecutor(
-            max_workers=workers,
-            initializer=_file_worker_init,
-            initargs=(str(self.output_root), no_marker),
-            mp_context=ctx,
-        ) as executor:
-            future_to_path = {
-                executor.submit(_file_worker_run, str(p)): p for p in process_list
-            }
-            for idx, fut in enumerate(as_completed(future_to_path), start=1):
-                file_path = future_to_path[fut]
-                file_key = str(file_path.relative_to(self.data_root))
-                self.reporter.file_start(idx, total, file_key)
-                try:
-                    result = fut.result()
-                    success = bool(result.get("ok", False))
-                    elapsed = float(result.get("elapsed", 0.0))
-                    if result.get("error"):
-                        self.reporter.warning(
-                            f"{file_key} worker error: {result['error']}"
-                        )
-                except Exception as e:
-                    success, elapsed = False, 0.0
-                    self.reporter.warning(f"{file_key} future raised: {e}")
+        pool_broken = False
+        try:
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_file_worker_init,
+                initargs=(str(self.output_root), no_marker),
+                mp_context=ctx,
+            ) as executor:
+                future_to_path = {
+                    executor.submit(_file_worker_run, str(p)): p for p in process_list
+                }
+                for idx, fut in enumerate(as_completed(future_to_path), start=1):
+                    file_path = future_to_path[fut]
+                    file_key = str(file_path.relative_to(self.data_root))
+                    self.reporter.file_start(idx, total, file_key)
+                    try:
+                        result = fut.result()
+                        success = bool(result.get("ok", False))
+                        elapsed = float(result.get("elapsed", 0.0))
+                        if result.get("error"):
+                            self.reporter.warning(
+                                f"{file_key} worker error: {result['error']}"
+                            )
+                    except Exception as e:
+                        success, elapsed = False, 0.0
+                        self.reporter.warning(f"{file_key} future raised: {e}")
 
-                if success:
-                    self.processed_files[file_key] = "SUCCESS"
-                    ok += 1
-                else:
-                    self.processed_files[file_key] = "FAILED"
-                    failed += 1
-                self.reporter.file_done(file_key, ok=success, elapsed=elapsed)
-                self._save_tracker()
+                    if success:
+                        self.processed_files[file_key] = "SUCCESS"
+                        ok += 1
+                    else:
+                        self.processed_files[file_key] = "FAILED"
+                        failed += 1
+                    self.reporter.file_done(file_key, ok=success, elapsed=elapsed)
+                    self._save_tracker()
+        except Exception as e:
+            self.reporter.warning(
+                f"file-level pool fatal ({type(e).__name__}: {e})；"
+                f"剩餘未跑檔將以 sequential 接手"
+            )
+            pool_broken = True
+
+        if pool_broken:
+            # 計算還沒處理的（沒進 processed_files 的） → 接手 sequential 跑
+            remaining = [
+                p for p in process_list
+                if self.processed_files.get(str(p.relative_to(self.data_root)))
+                not in {"SUCCESS", "FAILED"}
+            ]
+            if remaining:
+                # 用 process_all 對剩餘檔 sequential 跑（會自己掃整個 data_root，
+                # 但 skip_success 會自然跳過已處理的；此為合理 fallback）
+                seq_ok, seq_failed = self.process_all(
+                    skip_success=True, allow_overwrite_labeled=allow_overwrite_labeled,
+                )
+                ok += seq_ok
+                failed += seq_failed
 
         RAGPipeline.cleanup_gpu()
         self.reporter.batch_done(ok, failed)

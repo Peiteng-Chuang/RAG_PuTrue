@@ -60,20 +60,33 @@ def _worker_init() -> None:
 
 
 def _worker_run(pdf_path: str) -> dict:
-    """Worker：跑 marker single-page PDF，回 dict({text, images_bytes})。"""
+    """Worker：跑 marker single-page PDF，回 dict({text, images_bytes, image_errors})。
+
+    R5：image PNG 序列化失敗時不再 silent skip；把 (orig_name, error_msg) 收進
+    image_errors list 帶回主程式，由 _apply_marker_result 在主程式印 warning。
+    """
     global _worker_converter
     from marker.output import text_from_rendered  # noqa: WPS433
     rendered = _worker_converter(pdf_path)
     page_text, _, images = text_from_rendered(rendered)
     images_bytes: dict[str, bytes] = {}
+    image_errors: list[dict[str, str]] = []
     for k, img in (images or {}).items():
         buf = io.BytesIO()
         try:
             img.save(buf, format="PNG")
             images_bytes[k] = buf.getvalue()
-        except Exception:
+        except Exception as e:
+            image_errors.append({
+                "orig_name": str(k),
+                "error": f"{type(e).__name__}: {e}",
+            })
             continue
-    return {"text": page_text or "", "images": images_bytes}
+    return {
+        "text": page_text or "",
+        "images": images_bytes,
+        "image_errors": image_errors,
+    }
 
 
 def deserialize_images(images_bytes: dict[str, bytes]) -> dict[str, Any]:

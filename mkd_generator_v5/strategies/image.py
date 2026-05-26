@@ -67,9 +67,17 @@ class HashNamedImageExtractor(ImageExtractor):
                     continue
 
                 # 取 hash（優先吃 template scan 算過的 cache）
-                img_hash = ctx.filter_state.xref_to_hash_cache.get(xref)
-                if not img_hash:
-                    base_img = ctx.doc.extract_image(xref)
+                # cache 內 None 是 bad xref sentinel，直接 skip 不重試
+                if xref in ctx.filter_state.xref_to_hash_cache:
+                    img_hash = ctx.filter_state.xref_to_hash_cache[xref]
+                    if img_hash is None:
+                        continue
+                else:
+                    try:
+                        base_img = ctx.doc.extract_image(xref)
+                    except (ValueError, RuntimeError):
+                        ctx.filter_state.xref_to_hash_cache[xref] = None
+                        continue
                     img_hash = hashlib.md5(base_img["image"]).hexdigest()
                     ctx.filter_state.xref_to_hash_cache[xref] = img_hash
 
@@ -87,7 +95,12 @@ class HashNamedImageExtractor(ImageExtractor):
                     ))
                     continue
 
-                base_img = ctx.doc.extract_image(xref)
+                try:
+                    base_img = ctx.doc.extract_image(xref)
+                except (ValueError, RuntimeError):
+                    # template scan 時 OK 但這次撈失敗（罕見但 PyMuPDF 偶會）
+                    ctx.filter_state.xref_to_hash_cache[xref] = None
+                    continue
                 if base_img["width"] < ctx.min_image_dim or base_img["height"] < ctx.min_image_dim:
                     continue
 

@@ -18,7 +18,8 @@ class FilterState:
     blacklisted_regions: dict[str, list[list[float]]] = field(default_factory=dict)
     banned_global_texts: set[str] = field(default_factory=set)
     banned_image_hashes: set[str] = field(default_factory=set)
-    xref_to_hash_cache: dict[int, str] = field(default_factory=dict)
+    xref_to_hash_cache: dict[int, str | None] = field(default_factory=dict)
+    # None = bad xref (PyMuPDF extract_image raise ValueError)，下游看到直接 skip 不重試
 
 
 @dataclass

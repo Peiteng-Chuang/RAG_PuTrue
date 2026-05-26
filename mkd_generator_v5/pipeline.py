@@ -97,7 +97,17 @@ class RAGPipeline:
 
             # Phase 2: open + template scan
             self.reporter.phase("FITZ_SCANNING")
-            doc = fitz.open(working_pdf)
+            # R3: fitz.open 獨立 try/except，accurate 錯誤訊息 + 早 return
+            try:
+                doc = fitz.open(working_pdf)
+            except Exception as e:
+                self.reporter.warning(
+                    f"pipeline failed at fitz.open({working_pdf.name}): "
+                    f"{type(e).__name__}: {e}"
+                )
+                import traceback as _tb
+                _tb.print_exc()
+                return False
             filter_state = self.template_filter.scan(doc)
             self.reporter.phase(
                 "FITZ_SCAN_DONE",
@@ -135,14 +145,25 @@ class RAGPipeline:
                 page = CachedPage(doc[page_idx])
                 title_hit = self.title_extractor.extract(page)
                 title_text = title_hit.text if title_hit else None
-                route = self.triage.route(page)
+                # R2: triage.route 任何 exception 不擋頁；fallback fast 並紀錄到 decision log
+                route_fallback = False
+                try:
+                    route = self.triage.route(page)
+                except Exception as e:
+                    self.reporter.warning(
+                        f"triage.route P{page_idx + 1} failed ({type(e).__name__}: {e})"
+                        f"; fallback to fast"
+                    )
+                    route = "fast"
+                    route_fallback = True
                 if self.enable_triage_log:
                     try:
                         explain = self.triage.explain(page)
                     except Exception:
                         explain = {}
                     triage_log.append({
-                        "page": page_idx + 1, "route": route, **explain,
+                        "page": page_idx + 1, "route": route,
+                        "route_fallback": route_fallback, **explain,
                     })
                 if route == "slow":
                     placeholder = f"[[MARKER_REPLACE_P{page_idx}]]"
@@ -164,11 +185,20 @@ class RAGPipeline:
                         for h in title_hit.headings.inline_headings:
                             body_blocks.append((h.y0, f"#### {h.text}"))
                     body_blocks.sort(key=lambda x: x[0])
-                    body = "\n".join(t for _, t in body_blocks) + "\n\n"
-
                     image_refs = self.image_extractor.extract_fast(page, ctx)
-                    for ref in image_refs:
-                        body += ref.to_md_line()
+
+                    # R7：body 空時不留虛空白；image refs 也空就 body=""
+                    if body_blocks:
+                        body = "\n".join(t for _, t in body_blocks).rstrip("\n")
+                    else:
+                        body = ""
+                    if image_refs:
+                        if body:
+                            body += "\n\n"
+                        for ref in image_refs:
+                            body += ref.to_md_line()
+                    # 連續 \n{3,} 正規化為 \n\n（重影 / 空行清理）
+                    body = re.sub(r"\n{3,}", "\n\n", body)
 
                     subtitle_text = None
                     if title_hit and title_hit.headings and title_hit.headings.subtitle:
@@ -405,6 +435,12 @@ class RAGPipeline:
             if err:
                 self.reporter.warning(f"marker pool P{page_idx + 1}: {err}")
                 continue
+            # R5：worker 蒐集的單張圖序列化錯誤 → 在主程式 emit warning
+            for img_err in result.get("image_errors", []) or []:
+                self.reporter.warning(
+                    f"marker pool P{page_idx + 1} image serialize "
+                    f"orig={img_err.get('orig_name')}: {img_err.get('error')}"
+                )
             page_text = result.get("text", "")
             if not page_text:
                 continue
