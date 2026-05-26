@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -26,8 +25,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-# 對齊 run_v5.py 的 CUDA env 設定；必須在 import torch 前
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# S2 註記：若想用 expandable_segments（PyTorch 2.1+），在 shell 自己 export；
+# 預設不在程式內主動設，避免老 PyTorch / driver 組合 silent crash。
 
 from mkd_generator_v5 import default_pipeline
 from mkd_generator_v5.progress import SilentReporter

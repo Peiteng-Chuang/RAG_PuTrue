@@ -21,12 +21,13 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
-# S2: 用 expandable_segments 降低 fragmentation；必須在 import torch 前設置才生效
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# S2 註記：若想用 expandable_segments（PyTorch 2.1+），在 shell 自己 export：
+#   PowerShell: $env:PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
+#   Bash:       export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# 預設不主動設，避免老 PyTorch / driver 組合 silent crash。
 
 
 DEFAULT_DATA_ROOT = r"D:/璞真RAG資料夾/12.個案銷講資料"
@@ -34,16 +35,21 @@ DEFAULT_OUTPUT_ROOT = "./mkdata"
 
 
 def _build_marker_converter():
+    # 拆兩段 print：import 跟 model build 各有獨立等待期，每段都先報訊號
+    print("🔧 [1/2] 載入 Marker 套件中（首次 import 含 Surya/OCR 子模組，需數秒~30+ 秒）...",
+          flush=True)
     try:
         from marker.converters.pdf import PdfConverter
         from marker.models import create_model_dict
-        print("🔧 載入 Marker 模型（首次需數十秒）...")
-        return PdfConverter(artifact_dict=create_model_dict())
     except ImportError as e:
-        print(f"⚠️ Marker 套件未裝（{e}）。 CAD 頁將留 placeholder。")
+        print(f"⚠️ Marker 套件未裝（{e}）。CAD 頁將留 placeholder。")
         return None
+    print("🔧 [2/2] 載入 Marker 模型 weights（首次需數十秒到幾分鐘，後續較快）...",
+          flush=True)
+    try:
+        return PdfConverter(artifact_dict=create_model_dict())
     except Exception as e:
-        print(f"⚠️ Marker 模型載入失敗（{e}）。 CAD 頁將留 placeholder。")
+        print(f"⚠️ Marker 模型載入失敗（{e}）。CAD 頁將留 placeholder。")
         return None
 
 
