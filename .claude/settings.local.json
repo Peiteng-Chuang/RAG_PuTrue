@@ -32,7 +32,19 @@
       "Bash(git stash *)",
       "Bash(awk 'NR>1 {print $6, $7, $8}')",
       "Bash(PYTHONIOENCODING=utf-8 ./venv312/Scripts/python.exe -c ' *)",
-      "Bash(PYTHONIOENCODING=utf-8 ./venv312/Scripts/python.exe run_v5.py --help)"
+      "Bash(PYTHONIOENCODING=utf-8 ./venv312/Scripts/python.exe run_v5.py --help)",
+      "Bash(grep -nE \"!\\\\\\\\\\\\\\\\\\\\[|IMG_REF_RE|image.*ref.*write|strip_image|remove_image|delete_image|extract_image\" *.py)",
+      "Bash(grep -nE \"##\\\\\\\\\\\\\\\\s|###|h3|heading|HEADING_RE|sub.*\\\\\\\\\\\\\\\\#\" *.py)",
+      "Bash(c:/project_file/RAG_PuTrue/venv312/Scripts/python.exe -c \"import ast, pathlib; ast.parse\\(pathlib.Path\\('md_review_ui.py'\\).read_text\\(encoding='utf-8'\\)\\); print\\('OK syntax'\\)\")",
+      "Bash(c:/project_file/RAG_PuTrue/venv312/Scripts/python.exe -c \"print\\('hi'\\)\")",
+      "Bash(c:/project_file/RAG_PuTrue/venv312/Scripts/python.exe -c ' *)",
+      "Bash(docker volume *)",
+      "Bash(docker exec *)",
+      "Bash(echo \"=== container 內 \\\\\\\\Program Files\\\\\\\\Git\\\\\\\\qdrant\\\\\\\\storage（被誤掛的空目錄）===\")",
+      "Bash(curl -s http://localhost:6333/collections)",
+      "PowerShell(docker exec qdrant *)",
+      "PowerShell(Test-Path *)",
+      "PowerShell(Get-FileHash *)"
     ]
   }
 }

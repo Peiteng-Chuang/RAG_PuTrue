@@ -29,8 +29,7 @@ from llm_chat import ChatBot
 def init_client():
     load_dotenv()
     ollama_host = os.getenv("OLLAMA_HOST")
-    # model_name = os.getenv("LLM_MODEL_NAME")  #qwen3 32b 模型較大，改用更輕量的選項測試
-    model_name = os.getenv("LLM_MODEL_NAME_7B") # 預設改用 mistral-7b 模型，測試更輕量的選項
+    model_name = os.getenv("LLM_MODEL_NAME")
     if not ollama_host or not model_name:
         raise RuntimeError("請確認 .env 中 OLLAMA_HOST 與 LLM_MODEL_NAME 已設定")
     print("連線 Ollama:", ollama_host, "/", model_name)

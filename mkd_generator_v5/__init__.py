@@ -21,13 +21,18 @@
 from .pipeline import RAGPipeline
 from .batch import BatchProcessor
 from .progress import ProgressReporter, ConsoleReporter, TqdmReporter, SilentReporter
+from .types import (
+    TitleHit, FilterState, ImageRef, ExtractContext, PageFragment,
+    HeadingSpan, PageHeadings,
+)
 from .strategies import (
     FormatConverter, LibreOfficeConverter,
     TemplateFilter, PositionalTemplateFilter,
-    TitleExtractor, FontSizeTitleExtractor,
-    TextCleaner, BlocksTextCleaner,
+    TitleExtractor, FontSizeTitleExtractor, HierarchicalTitleExtractor,
+    TextCleaner, BlocksTextCleaner, SpanLevelTextCleaner,
     ImageExtractor, HashNamedImageExtractor,
     TriageStrategy, DrawingCountTriage,
+    MultiSignalTriage, AdaptiveTriage, AllFastTriage, AllSlowTriage,
     Stitcher, PageFragmentStitcher,
 )
 
@@ -35,18 +40,28 @@ from .strategies import (
 def default_pipeline(
     marker_converter=None,
     reporter: ProgressReporter | None = None,
+    triage: TriageStrategy | None = None,
+    enable_triage_log: bool = True,
+    marker_pool_workers: int = 0,
 ):
-    """v4 行為等價 + W5/C 圖檔命名統一。"""
+    """v5 預設配置：HierarchicalTitleExtractor + B-surgical cleaner + 統一圖檔命名。
+
+    triage：可注入自訂策略，預設 DrawingCountTriage(200)
+    enable_triage_log：寫 per-file _triage_log/{stem}.jsonl，方便事後 audit
+    marker_pool_workers：S3，>0 → process pool 平行跑 Marker，**4090 上 max=2 安全**
+    """
     return RAGPipeline(
         converter=LibreOfficeConverter(),
         template_filter=PositionalTemplateFilter(),
-        title_extractor=FontSizeTitleExtractor(),
-        text_cleaner=BlocksTextCleaner(),
+        title_extractor=HierarchicalTitleExtractor(),
+        text_cleaner=SpanLevelTextCleaner(),
         image_extractor=HashNamedImageExtractor(),
-        triage=DrawingCountTriage(threshold=200),
+        triage=triage or DrawingCountTriage(threshold=200),
         stitcher=PageFragmentStitcher(),
         marker_converter=marker_converter,
         reporter=reporter or ConsoleReporter(),
+        enable_triage_log=enable_triage_log,
+        marker_pool_workers=marker_pool_workers,
     )
 
 
@@ -55,12 +70,16 @@ __all__ = [
     "RAGPipeline", "BatchProcessor", "default_pipeline",
     # progress
     "ProgressReporter", "ConsoleReporter", "TqdmReporter", "SilentReporter",
+    # data types
+    "TitleHit", "FilterState", "ImageRef", "ExtractContext", "PageFragment",
+    "HeadingSpan", "PageHeadings",
     # strategies (ABC + default impl)
     "FormatConverter", "LibreOfficeConverter",
     "TemplateFilter", "PositionalTemplateFilter",
-    "TitleExtractor", "FontSizeTitleExtractor",
-    "TextCleaner", "BlocksTextCleaner",
+    "TitleExtractor", "FontSizeTitleExtractor", "HierarchicalTitleExtractor",
+    "TextCleaner", "BlocksTextCleaner", "SpanLevelTextCleaner",
     "ImageExtractor", "HashNamedImageExtractor",
     "TriageStrategy", "DrawingCountTriage",
+    "MultiSignalTriage", "AdaptiveTriage", "AllFastTriage", "AllSlowTriage",
     "Stitcher", "PageFragmentStitcher",
 ]

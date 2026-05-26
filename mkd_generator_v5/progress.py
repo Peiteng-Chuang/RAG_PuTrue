@@ -45,6 +45,70 @@ class SilentReporter(ProgressReporter):
     def warning(self, msg): pass
 
 
+class _PhaseTimer:
+    """Phase 計時助手，供 ConsoleReporter / TqdmReporter 內部使用。
+
+    每次 phase() 切換把上一個 phase 的 elapsed 累積進 per-file 跟 batch 兩份 dict。
+    `_DONE` 結尾的 phase name 視為「事件標記」（如 FITZ_SCAN_DONE），不算新 phase 起點，
+    只觸發前一 phase 的 close。
+    """
+    def __init__(self):
+        self.batch_totals: dict[str, float] = {}
+        self.batch_counts: dict[str, int] = {}
+        self._file_totals: dict[str, float] = {}
+        self._current: str | None = None
+        self._t0: float | None = None
+
+    def file_start(self) -> None:
+        self._current = None
+        self._t0 = None
+        self._file_totals = {}
+
+    def phase(self, name: str) -> None:
+        self._close_current()
+        if name.endswith("_DONE"):
+            return
+        self._current = name
+        self._t0 = time.time()
+        self.batch_counts[name] = self.batch_counts.get(name, 0) + 1
+
+    def file_done(self) -> str:
+        """關掉跑中的 phase，回傳 per-file breakdown 字串（無資料回 ""）。"""
+        self._close_current()
+        if not self._file_totals:
+            return ""
+        total = sum(self._file_totals.values())
+        items = sorted(self._file_totals.items(), key=lambda kv: -kv[1])
+        if total <= 0:
+            parts = [f"{name} {secs:.1f}s" for name, secs in items]
+        else:
+            parts = [f"{name} {secs:.1f}s ({secs/total*100:.0f}%)" for name, secs in items]
+        return "    ⏱  " + " · ".join(parts)
+
+    def batch_done(self) -> str:
+        """跨檔 phase 加總 breakdown（無資料回 ""）。"""
+        self._close_current()
+        if not self.batch_totals:
+            return ""
+        total = sum(self.batch_totals.values())
+        items = sorted(self.batch_totals.items(), key=lambda kv: -kv[1])
+        lines = ["⏱ phase breakdown (batch, sum across files):"]
+        for name, secs in items:
+            pct = (secs / total * 100) if total > 0 else 0.0
+            cnt = self.batch_counts.get(name, 0)
+            lines.append(f"   {name:<22} {secs:7.1f}s ({pct:5.1f}%)  ×{cnt}")
+        return "\n".join(lines)
+
+    def _close_current(self) -> None:
+        if self._current is None or self._t0 is None:
+            return
+        elapsed = time.time() - self._t0
+        self._file_totals[self._current] = self._file_totals.get(self._current, 0.0) + elapsed
+        self.batch_totals[self._current] = self.batch_totals.get(self._current, 0.0) + elapsed
+        self._current = None
+        self._t0 = None
+
+
 class ConsoleReporter(ProgressReporter):
     """純 print 版。對齊 v4 風格（emoji + 中文），但更勤奮回報。
 
@@ -56,6 +120,7 @@ class ConsoleReporter(ProgressReporter):
         self._file_t0: float | None = None
         self._last_page_print_pct: int = -1
         self._is_tty = sys.stdout.isatty()
+        self._timer = _PhaseTimer()
 
     def batch_start(self, total):
         self._batch_t0 = time.time()
@@ -64,17 +129,25 @@ class ConsoleReporter(ProgressReporter):
     def batch_done(self, ok, failed):
         elapsed = (time.time() - self._batch_t0) if self._batch_t0 else 0.0
         print(f"\n🏁 批次完成：成功 {ok} · 失敗 {failed} · 耗時 {elapsed:.1f}s")
+        batch_breakdown = self._timer.batch_done()
+        if batch_breakdown:
+            print(batch_breakdown)
 
     def file_start(self, idx, total, name):
         self._file_t0 = time.time()
         self._last_page_print_pct = -1
+        self._timer.file_start()
         print(f"\n[{idx}/{total}] 📄 {name}")
 
     def file_done(self, name, ok, elapsed):
+        breakdown = self._timer.file_done()
         icon = "✅" if ok else "❌"
         print(f"  {icon} {elapsed:.1f}s")
+        if breakdown:
+            print(breakdown)
 
     def phase(self, phase_name, detail=""):
+        self._timer.phase(phase_name)
         self._last_page_print_pct = -1
         suffix = f" — {detail}" if detail else ""
         print(f"  ▶ {phase_name}{suffix}")
@@ -115,6 +188,7 @@ class TqdmReporter(ProgressReporter):
         self._batch_bar = None
         self._page_bar = None
         self._current_file_name: str | None = None
+        self._timer = _PhaseTimer()
 
     def _f(self) -> ConsoleReporter | None:
         return self._fallback
@@ -129,10 +203,14 @@ class TqdmReporter(ProgressReporter):
             self._batch_bar.close()
             self._batch_bar = None
         print(f"🏁 成功 {ok} · 失敗 {failed}")
+        breakdown = self._timer.batch_done()
+        if breakdown:
+            print(breakdown)
 
     def file_start(self, idx, total, name):
         if self._f(): return self._f().file_start(idx, total, name)
         self._current_file_name = name
+        self._timer.file_start()
         if self._batch_bar:
             self._batch_bar.set_postfix_str(name[:40])
 
@@ -141,11 +219,15 @@ class TqdmReporter(ProgressReporter):
         if self._page_bar:
             self._page_bar.close()
             self._page_bar = None
+        breakdown = self._timer.file_done()
         if self._batch_bar:
             self._batch_bar.update(1)
+        if breakdown and self._tqdm:
+            self._tqdm.write(breakdown)
 
     def phase(self, phase_name, detail=""):
         if self._f(): return self._f().phase(phase_name, detail)
+        self._timer.phase(phase_name)
         # 切 phase 時關掉 page bar
         if self._page_bar:
             self._page_bar.close()

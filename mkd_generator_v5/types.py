@@ -22,6 +22,50 @@ class FilterState:
 
 
 @dataclass
+class HeadingSpan:
+    """單一 heading 的位置與字級資訊。"""
+    text: str
+    bbox: tuple[float, float, float, float] | None
+    size: float                                   # font size, 四捨五入到 1 位
+    level: int                                    # 1=page_title, 2=subtitle, 3=inline H3, 4=inline H4
+    y0: float                                     # 排序用
+
+
+@dataclass
+class PageHeadings:
+    """HierarchicalTitleExtractor 輸出。包整頁所有 heading 階層。"""
+    page_title: HeadingSpan | None = None
+    subtitle: HeadingSpan | None = None
+    inline_headings: list[HeadingSpan] = field(default_factory=list)  # P2 才填
+
+    @property
+    def all_title_bboxes(self) -> list[tuple[float, float, float, float]]:
+        """cleaner 要排除的全部 heading span bbox。"""
+        out: list[tuple[float, float, float, float]] = []
+        if self.page_title and self.page_title.bbox:
+            out.append(self.page_title.bbox)
+        if self.subtitle and self.subtitle.bbox:
+            out.append(self.subtitle.bbox)
+        for h in self.inline_headings:
+            if h.bbox:
+                out.append(h.bbox)
+        return out
+
+
+@dataclass
+class TitleHit:
+    """TitleExtractor.extract() 輸出。
+
+    bbox 是被選為 page_title 的 span bbox（x0, y0, x1, y1），給 cleaner 做
+    「title span」判斷用。合成 title（如 "續前頁內容"）bbox=None。
+    headings 為 HierarchicalTitleExtractor 額外帶的完整階層；舊 extractor 留 None。
+    """
+    text: str
+    bbox: tuple[float, float, float, float] | None = None
+    headings: PageHeadings | None = None
+
+
+@dataclass
 class ImageRef:
     """ImageExtractor 輸出。"""
     md_path: str          # MD 內 ![](...) 的 path 部分，例如 `folder/file.jpeg`
@@ -55,6 +99,7 @@ class PageFragment:
     """單頁產出。pipeline 收集成 list，最後丟給 Stitcher。
 
     body 可能含 placeholder（如 `[[MARKER_REPLACE_PN]]`），由 marker stage 替換。
+    階層約定：`##` = page anchor、`###` = title (page_title)、`####` = subtitle 與 inline。
     """
     page_idx: int                          # 0-based
     page_num: int                          # 1-based（= page_idx + 1）
@@ -62,12 +107,16 @@ class PageFragment:
     body: str
     is_marker_page: bool
     marker_placeholder: str | None = None  # 慢路徑用，標示要被替換的 anchor
+    subtitle: str | None = None            # P2: 副標，渲染為緊接 ### title 下的 ####
 
     def render(self) -> str:
         """組裝為 MD 區塊。慢路徑頁的 body 仍含 placeholder 時，render 不展開。"""
         header = f"## 第 {self.page_num} 頁\n"
         if self.title:
-            header += f"### {self.title}\n\n"
+            header += f"### {self.title}\n"
+            if self.subtitle:
+                header += f"#### {self.subtitle}\n"
+            header += "\n"
         else:
             header += "\n"
         return f"{header}{self.body}\n---\n"
