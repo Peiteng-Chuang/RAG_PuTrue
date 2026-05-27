@@ -44,7 +44,9 @@
       "Bash(curl -s http://localhost:6333/collections)",
       "PowerShell(docker exec qdrant *)",
       "PowerShell(Test-Path *)",
-      "PowerShell(Get-FileHash *)"
+      "PowerShell(Get-FileHash *)",
+      "Bash(git commit *)",
+      "Bash(git *)"
     ]
   }
 }

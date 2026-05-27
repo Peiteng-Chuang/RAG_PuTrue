@@ -90,7 +90,7 @@ EMBEDDING_MODEL = "BAAI/bge-m3"
 EMBEDDING_VERSION = "v1"
 EMBEDDING_DIM_DENSE = 1024
 SIDECAR_VERSION = "1.0"
-CHUNKING_STRATEGY = "heading+token-v1"
+CHUNKING_STRATEGY = "heading+token-v2"
 REVIEW_STATUSES = ["unprocessed", "processing", "encoded", "ingested"]
 STATUS_BADGE = {
     "unprocessed": {"emoji": "🔴", "label": "未處理",   "bg": "#fdecec", "fg": "#c0392b"},
@@ -608,6 +608,42 @@ def strip_image_refs(text: str) -> str:
     return cleaned
 
 
+# 怪字 bullet 符號集（黑方塊/圓圈/原點/菱形等，markdown_report A2）。
+# 不含 markdown 標準 `-*+`（那是合法 list marker，僅在與 glyph 同行時順帶處理）。
+BULLET_GLYPHS = "■□●○◎◯◆◇▪▫♦◊•‣⁃‧·∙・◦►▶▷▸▹❖✦◾◽∎"
+# 行首 bullet marker：可選 markdown list（- * +）、可選 bold-open（**）、一個以上 glyph、
+# 可選分隔符（. 、 ,）。group(1)=縮排、group(2)=被吃掉的 bold-open（用來決定是否去尾 **）。
+_LEADING_BULLET_RE = re.compile(
+    rf"^([ \t]*)(?:[-*+][ \t]+)?(\*\*)?[ \t]*[{BULLET_GLYPHS}]+[ \t]*[.、,]?[ \t]*"
+)
+# 「整行只有符號/星號/list marker/分隔符」的垃圾行偵測用字元集
+_BULLET_NOISE_CHARS = re.compile(rf"[\s*+.、,\-{BULLET_GLYPHS}]")
+
+
+def _strip_bullet_line(line: str) -> str | None:
+    """正規化單行的怪字 bullet（A2）。回 None 表示整行是純符號垃圾、應丟棄。
+
+    - 只剝「行首」符號（行內符號保留，依使用者選擇不拆黏行）
+    - 連同包住整行的 bold（`**...**`）一起去掉
+    - `- ****`、`•`、`****` 這類只有符號的空行 → 丟棄
+    """
+    if line.strip() and not _BULLET_NOISE_CHARS.sub("", line):
+        return None
+    m = _LEADING_BULLET_RE.match(line)
+    if not m:
+        return line
+    rest = line[m.end():]
+    if m.group(2):  # 行首吃掉了 bold-open → 去對應的 bold-close
+        rest = re.sub(r"[ \t]*\*\*[ \t]*$", "", rest)
+    return m.group(1) + rest
+
+
+def _normalize_bullet_glyphs(text: str) -> str:
+    """逐行剝除怪字 bullet 符號 + 丟棄純符號垃圾行，回正規化後文字（A2）。"""
+    kept = [s for ln in text.split("\n") if (s := _strip_bullet_line(ln)) is not None]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept))
+
+
 def derive_image_label_key(headings: dict[int, str], section_body: str) -> str:
     """
     決定該 section 圖片標籤的 key：
@@ -627,6 +663,60 @@ def derive_image_label_key(headings: dict[int, str], section_body: str) -> str:
     return "image"
 
 
+def _demote_orphan_leaf_headings(sections: list[dict]) -> list[dict]:
+    """把「孤兒葉節點標題」降級為內容文字（markdown_report A1/B 修正）。
+
+    chunking 以 heading 階層作 breadcrumb metadata。若某 section 的最深層 heading
+    底下沒有任何非標題內文（只剩更深標題或圖片連結），它在切 chunk 時要嘛被當成
+    純路徑節點、要嘛因 body 空整段被 skip，導致該標題攜帶的有意義文字
+    （如「系統管材概要說明」）從未進向量庫、檢索不到。
+
+    規則（逐 section 判定）：一個 section 的最深層 heading 若同時滿足
+      (1) 底下無文字 body（圖片連結不算內文），且
+      (2) 不被任何更深的 section 接續（即它是葉節點，而非結構容器）
+    則把該最深標題從 headings 路徑移除、改寫成 body 一行文字。**降級層不進路徑**，
+    更上層 heading 仍保留為 breadcrumb（只降最深一層，對齊「最小的子標題轉為內容」）。
+    最後合併路徑相同的相鄰 section，讓同一父標題下多條降級文字併為一塊。
+    """
+    def is_extended(idx: int) -> bool:
+        """sections[idx] 的最深 heading 是否被某個更深 section 沿用（= 有子節點）。"""
+        path = sections[idx]["headings"]
+        if not path:
+            return False
+        lmax = max(path)
+        for j, other in enumerate(sections):
+            if j == idx:
+                continue
+            opath = other["headings"]
+            if max(opath, default=-1) <= lmax:
+                continue
+            if all(opath.get(lvl) == title for lvl, title in path.items()):
+                return True
+        return False
+
+    demoted: list[dict] = []
+    for i, sec in enumerate(sections):
+        headings = dict(sec["headings"])
+        body = sec["body"]
+        if headings and not body and not is_extended(i):
+            body = headings.pop(max(headings))
+        demoted.append({
+            "headings": headings,
+            "body": body,
+            "image_paths": list(sec["image_paths"]),
+        })
+
+    merged: list[dict] = []
+    for sec in demoted:
+        if merged and merged[-1]["headings"] == sec["headings"]:
+            prev = merged[-1]
+            prev["body"] = "\n".join(b for b in (prev["body"], sec["body"]) if b)
+            prev["image_paths"].extend(sec["image_paths"])
+        else:
+            merged.append(sec)
+    return merged
+
+
 def split_page_by_headings(page_md: str) -> list[dict]:
     """
     把一頁切成 sections，支援 h3-h6 任意層級巢狀。
@@ -642,6 +732,7 @@ def split_page_by_headings(page_md: str) -> list[dict]:
     """
     body = re.sub(r"^## 第 \d+ 頁\s*\n", "", page_md)
     body = re.sub(r"\n---\s*\n?$", "", body)
+    body = _normalize_bullet_glyphs(body)  # A2：先清怪字 bullet，再做 heading 偵測/A1 降級
 
     def make_section(headings: dict[int, str], raw: str) -> dict:
         imgs = [r["md_path"] for r in parse_images_in_page(raw)]
@@ -674,7 +765,7 @@ def split_page_by_headings(page_md: str) -> list[dict]:
         sec_end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
         sections.append(make_section(current, body[sec_start:sec_end]))
 
-    return sections
+    return _demote_orphan_leaf_headings(sections)
 
 
 def decode_delim(s: str) -> str:
