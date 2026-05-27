@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import hashlib
 import re
-import sys
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -94,10 +93,10 @@ class PositionalTemplateFilter(TemplateFilter):
                         img_data = doc.extract_image(xref)
                         state.xref_to_hash_cache[xref] = hashlib.md5(img_data["image"]).hexdigest()
                     except (ValueError, RuntimeError) as e:
-                        print(
-                            f"[WARN] template scan: bad xref={xref} on page {page_idx + 1} "
-                            f"({type(e).__name__}: {e}) — 標記跳過",
-                            file=sys.stderr, flush=True,
+                        # P1：warning 累積到 state.warnings，pipeline 統一 emit
+                        state.warnings.append(
+                            f"template scan: bad xref={xref} on page {page_idx + 1} "
+                            f"({type(e).__name__}: {e}) — 標記跳過"
                         )
                         state.xref_to_hash_cache[xref] = None
                         continue

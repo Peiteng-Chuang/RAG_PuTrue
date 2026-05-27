@@ -6,14 +6,13 @@
 from __future__ import annotations
 
 import re
-import sys
 from abc import ABC, abstractmethod
 from collections import Counter
 
 from ..types import HeadingSpan, PageHeadings, TitleHit
 
 
-# R6：縮窄 except 範圍。預期的 PyMuPDF 解析錯誤 → 印 stderr warning 並 return None；
+# R6：縮窄 except 範圍。預期的 PyMuPDF 解析錯誤 → 累積到 collected_warnings；
 # 其他 exception（程式 bug 等）不抓，往上拋。
 _TITLE_PARSE_ERRORS = (ValueError, RuntimeError, KeyError, TypeError)
 
@@ -47,6 +46,8 @@ class FontSizeTitleExtractor(TitleExtractor):
         self.continuation_text = continuation_text
         self.size_tolerance = size_tolerance
         self.list_prefixes = list_prefixes
+        # P1：strategy 不持有 reporter，warning 累積到 instance 由 pipeline 取走 emit
+        self.collected_warnings: list[str] = []
 
     def extract(self, page) -> TitleHit | None:
         try:
@@ -85,10 +86,9 @@ class FontSizeTitleExtractor(TitleExtractor):
             return TitleHit(text=candidates[0]["text"], bbox=candidates[0]["bbox"])
         except _TITLE_PARSE_ERRORS as e:
             page_idx = getattr(page, "number", -1)
-            print(
-                f"[WARN] FontSizeTitleExtractor.extract P{page_idx + 1} failed "
-                f"({type(e).__name__}: {e}) — 跳過該頁 title",
-                file=sys.stderr, flush=True,
+            self.collected_warnings.append(
+                f"FontSizeTitleExtractor.extract P{page_idx + 1} failed "
+                f"({type(e).__name__}: {e}) — 跳過該頁 title"
             )
             return None
 
@@ -140,6 +140,8 @@ class HierarchicalTitleExtractor(TitleExtractor):
         self.subtitle_max_vertical_gap_ratio = subtitle_max_vertical_gap_ratio
         self.max_inline_headings = max_inline_headings
         self.inline_heading_min_size_gap = inline_heading_min_size_gap
+        # P1：strategy 不持有 reporter，warning 累積到 instance 由 pipeline 取走 emit
+        self.collected_warnings: list[str] = []
 
     def extract(self, page) -> TitleHit | None:
         """A2：orchestrator — 串接四個 step。每個 step 可單獨單元測試。
@@ -195,10 +197,9 @@ class HierarchicalTitleExtractor(TitleExtractor):
             blocks = page.get_text("dict")["blocks"]
         except _TITLE_PARSE_ERRORS as e:
             page_idx = getattr(page, "number", -1)
-            print(
-                f"[WARN] HierarchicalTitleExtractor.extract P{page_idx + 1} "
-                f"page.get_text failed ({type(e).__name__}: {e}) — 跳過該頁 title",
-                file=sys.stderr, flush=True,
+            self.collected_warnings.append(
+                f"HierarchicalTitleExtractor.extract P{page_idx + 1} "
+                f"page.get_text failed ({type(e).__name__}: {e}) — 跳過該頁 title"
             )
             return []
 

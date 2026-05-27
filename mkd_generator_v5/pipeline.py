@@ -85,6 +85,16 @@ class RAGPipeline:
         img_dir = output_base / f"{stem}_image"
         md_path = output_base / f"{stem}.md"
 
+        # P2：per-file 統計累積。warning_count 用 reporter wrap 計數
+        from .types import FileStats
+        stats = FileStats(file_name=input_path.name)
+        _real_warning = self.reporter.warning
+
+        def _counting_warning(msg: str) -> None:
+            stats.warning_count += 1
+            _real_warning(msg)
+        self.reporter.warning = _counting_warning  # type: ignore[method-assign]
+
         try:
             self._prepare_env(output_base, img_dir)
 
@@ -115,6 +125,10 @@ class RAGPipeline:
                 f"banned text={len(filter_state.banned_global_texts)}, "
                 f"banned img={len(filter_state.banned_image_hashes)}",
             )
+            # P1：template scan 累積的 warnings 統一 emit
+            for w in filter_state.warnings:
+                self.reporter.warning(w)
+            filter_state.warnings.clear()
 
             # 主標題：掃前 n 頁取最大字體 page_title，全空 fallback 用 stem
             main_title = self._resolve_main_title(doc, stem, n_scan=3)
@@ -141,6 +155,11 @@ class RAGPipeline:
             vector_indices: list[int] = []
             triage_log: list[dict] = []                 # S1: per-page decision log
             total_pages = len(doc)
+            stats.total_pages = total_pages
+            # P2：bad_xref 從 xref_to_hash_cache 的 None sentinel 數（穩定，不依賴 warning 字串）
+            stats.bad_xref_count = sum(
+                1 for v in filter_state.xref_to_hash_cache.values() if v is None
+            )
             self.reporter.phase(Phase.PER_PAGE, f"{total_pages} pages")
             for page_idx in range(total_pages):
                 page = CachedPage(doc[page_idx])
@@ -157,6 +176,7 @@ class RAGPipeline:
                     )
                     route = "fast"
                     route_fallback = True
+                    stats.triage_fallback_count += 1
                 if self.enable_triage_log:
                     try:
                         explain = self.triage.explain(page)
@@ -215,6 +235,19 @@ class RAGPipeline:
                     ))
                 self.reporter.page_progress(page_idx + 1, total_pages)
 
+            # P2：per-page loop 跑完，更新 fast/slow 計數
+            stats.slow_pages = len(vector_indices)
+            stats.fast_pages = total_pages - stats.slow_pages
+
+            # P1：PER_PAGE 結束後 emit title extractor 累積的 warnings
+            extractor_warnings = getattr(
+                self.title_extractor, "collected_warnings", None,
+            )
+            if extractor_warnings:
+                for w in extractor_warnings:
+                    self.reporter.warning(w)
+                extractor_warnings.clear()
+
             # Phase 4: marker stage（可選）
             if vector_indices:
                 if self.marker_converter is None:
@@ -265,6 +298,12 @@ class RAGPipeline:
             except Exception:
                 pass
             self._cleanup()
+            # P2：發 file_stats，再還原 reporter.warning
+            try:
+                self.reporter.file_stats(stats)
+            except Exception:
+                pass
+            self.reporter.warning = _real_warning  # type: ignore[method-assign]
 
     # ---- internal ----
 

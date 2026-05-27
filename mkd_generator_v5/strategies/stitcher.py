@@ -1,8 +1,6 @@
 """最終 MD 組裝。"""
 from __future__ import annotations
 
-import sys
-import traceback
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -36,8 +34,8 @@ class PageFragmentStitcher(Stitcher):
     """
 
     def stitch(self, fragments, meta, out):
-        """R4: 包 try/except，failed 印明確 warning 含 path + error 後 raise
-        讓 outer pipeline.run 仍標 FAILED。"""
+        """R4 + P1：寫檔失敗 raise chained exception，outer pipeline.run 抓到後
+        reporter.warning 會帶完整 path 與原始錯誤，不再額外印 stderr。"""
         try:
             out.parent.mkdir(parents=True, exist_ok=True)
             with open(out, "w", encoding="utf-8") as f:
@@ -49,10 +47,6 @@ class PageFragmentStitcher(Stitcher):
                 for frag in fragments:
                     f.write(frag.render())
         except Exception as e:
-            print(
-                f"[ERROR] stitch 寫 .md 失敗 (path={out}, "
-                f"{type(e).__name__}: {e})",
-                file=sys.stderr, flush=True,
-            )
-            traceback.print_exc(file=sys.stderr)
-            raise
+            raise RuntimeError(
+                f"stitch 寫 .md 失敗 (path={out}): {type(e).__name__}: {e}"
+            ) from e

@@ -1,9 +1,31 @@
 """進度回報抽象。ConsoleReporter 為 default；TqdmReporter / SilentReporter 替代。
 
 Pipeline 在 phase 切換、單頁完成時呼叫對應 method；reporter 自行決定怎麼呈現。
+
+P4 emoji 規範（ConsoleReporter / TqdmReporter / run_v5.py CLI 對齊）：
+
+| 用途 | Emoji | Reporter method |
+|---|---|---|
+| 批次 START | 🚀 | batch_start |
+| 批次 DONE | 🏁 | batch_done |
+| 單檔 START | 📄 | file_start |
+| 單檔 SUCCESS | ✅ | file_done (ok=True) |
+| 單檔 FAIL | ❌ | file_done (ok=False) |
+| Phase 切換 | ▶ | phase |
+| Warning | ⚠️ | warning |
+| File stats | 📊 | file_stats |
+| ETA 預估 | ⏳ | (ConsoleReporter.file_done 內每 N 檔印) |
+
+CLI 額外用 emoji（run_v5.py）：
+- 📋 掃描結果 summary
+- 🛡️ SAFE-SKIP（受保護檔，不覆寫）
+- ⏭ RESUME-SKIP（tracker 標 SUCCESS）
+
+避免重複 emoji 表達同一語意。新增 reporter method 時對齊此表，不要自創。
 """
 from __future__ import annotations
 
+import statistics
 import sys
 import time
 from abc import ABC, abstractmethod
@@ -50,6 +72,11 @@ class ProgressReporter(ABC):
     @abstractmethod
     def warning(self, msg: str) -> None: ...
 
+    def file_stats(self, stats) -> None:
+        """P2：optional hook，pipeline 在 file_done 之前 attach 單檔濃縮統計。
+        default 空，子類想印就 override。stats 是 mkd_generator_v5.types.FileStats。"""
+        pass
+
 
 class SilentReporter(ProgressReporter):
     """全靜音。給測試或自動化用。"""
@@ -60,6 +87,7 @@ class SilentReporter(ProgressReporter):
     def phase(self, phase_name, detail=""): pass
     def page_progress(self, curr, total, label=""): pass
     def warning(self, msg): pass
+    def file_stats(self, stats): pass
 
 
 class _PhaseTimer:
@@ -131,21 +159,37 @@ class ConsoleReporter(ProgressReporter):
 
     page_progress 用 \\r 在同一行更新（terminal-aware）；非 terminal 環境每 10% 才印一次。
     """
-    def __init__(self, page_progress_step_pct: int = 10):
+    def __init__(self, page_progress_step_pct: int = 10, eta_every_n: int = 10):
         self._page_step = max(1, page_progress_step_pct)
+        self._eta_every_n = max(1, eta_every_n)
         self._batch_t0: float | None = None
         self._file_t0: float | None = None
         self._last_page_print_pct: int = -1
         self._is_tty = sys.stdout.isatty()
         self._timer = _PhaseTimer()
+        # P5：per-file elapsed 累積，用於 P50/P95 + ETA
+        self._file_elapsed: list[float] = []
+        self._batch_total: int = 0
 
     def batch_start(self, total):
         self._batch_t0 = time.time()
+        self._batch_total = total
+        self._file_elapsed.clear()
         print(f"🚀 批次開始：共 {total} 個檔案")
 
     def batch_done(self, ok, failed):
         elapsed = (time.time() - self._batch_t0) if self._batch_t0 else 0.0
         print(f"\n🏁 批次完成：成功 {ok} · 失敗 {failed} · 耗時 {elapsed:.1f}s")
+        # P5：per-file P50/P95/mean
+        if self._file_elapsed:
+            mean = statistics.mean(self._file_elapsed)
+            p50 = statistics.median(self._file_elapsed)
+            sorted_e = sorted(self._file_elapsed)
+            p95_idx = max(0, min(len(sorted_e) - 1,
+                                 int(round(len(sorted_e) * 0.95)) - 1))
+            p95 = sorted_e[p95_idx]
+            print(f"  📊 per-file: mean={mean:.1f}s · P50={p50:.1f}s · "
+                  f"P95={p95:.1f}s · n={len(self._file_elapsed)}")
         batch_breakdown = self._timer.batch_done()
         if batch_breakdown:
             print(batch_breakdown)
@@ -162,6 +206,16 @@ class ConsoleReporter(ProgressReporter):
         print(f"  {icon} {elapsed:.1f}s")
         if breakdown:
             print(breakdown)
+        # P5：累積 elapsed，每 eta_every_n 檔印 ETA 估算
+        self._file_elapsed.append(elapsed)
+        n_done = len(self._file_elapsed)
+        if (self._batch_total > 0 and n_done < self._batch_total
+                and n_done % self._eta_every_n == 0):
+            mean = statistics.mean(self._file_elapsed)
+            eta_s = mean * (self._batch_total - n_done)
+            eta_min = eta_s / 60.0
+            print(f"  ⏳ ETA ~{eta_min:.1f} min "
+                  f"({n_done}/{self._batch_total} done, mean {mean:.1f}s/file)")
 
     def phase(self, phase_name, detail=""):
         self._timer.phase(phase_name)
@@ -187,6 +241,9 @@ class ConsoleReporter(ProgressReporter):
 
     def warning(self, msg):
         print(f"  ⚠️  {msg}")
+
+    def file_stats(self, stats):
+        print(f"  {stats.summary_line()}")
 
 
 class TqdmReporter(ProgressReporter):
@@ -271,3 +328,8 @@ class TqdmReporter(ProgressReporter):
         if self._f(): return self._f().warning(msg)
         if self._tqdm:
             self._tqdm.write(f"⚠️  {msg}")
+
+    def file_stats(self, stats):
+        if self._f(): return self._f().file_stats(stats)
+        if self._tqdm:
+            self._tqdm.write(stats.summary_line())

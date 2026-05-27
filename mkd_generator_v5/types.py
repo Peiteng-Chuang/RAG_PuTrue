@@ -20,6 +20,8 @@ class FilterState:
     banned_image_hashes: set[str] = field(default_factory=set)
     xref_to_hash_cache: dict[int, str | None] = field(default_factory=dict)
     # None = bad xref (PyMuPDF extract_image raise ValueError)，下游看到直接 skip 不重試
+    warnings: list[str] = field(default_factory=list)
+    # P1: template scan 階段累積的 warnings，pipeline 在 FITZ_SCAN_DONE 後統一 emit reporter.warning
 
 
 @dataclass
@@ -121,6 +123,32 @@ class PageFragment:
         else:
             header += "\n"
         return f"{header}{self.body}\n---\n"
+
+
+@dataclass
+class FileStats:
+    """P2：單檔處理結果濃縮統計。pipeline.run() 結尾 attach 到 reporter."""
+    file_name: str
+    total_pages: int = 0
+    fast_pages: int = 0
+    slow_pages: int = 0
+    bad_xref_count: int = 0          # template scan 偵測到的 bad xref 張數
+    triage_fallback_count: int = 0    # triage.route 失敗 fallback fast 的頁數
+    warning_count: int = 0            # 本檔累積 warning 總數
+
+    def summary_line(self) -> str:
+        """印一行濃縮（reporter ConsoleReporter 用）。"""
+        parts = [
+            f"📊 {self.total_pages} pages",
+            f"fast={self.fast_pages}/slow={self.slow_pages}",
+        ]
+        if self.bad_xref_count:
+            parts.append(f"bad_xref={self.bad_xref_count}")
+        if self.triage_fallback_count:
+            parts.append(f"triage_fallback={self.triage_fallback_count}")
+        if self.warning_count:
+            parts.append(f"warnings={self.warning_count}")
+        return " · ".join(parts)
 
 
 @dataclass
