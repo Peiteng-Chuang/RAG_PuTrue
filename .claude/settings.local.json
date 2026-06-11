@@ -46,7 +46,8 @@
       "PowerShell(Test-Path *)",
       "PowerShell(Get-FileHash *)",
       "Bash(git commit *)",
-      "Bash(git *)"
+      "Bash(git *)",
+      "Bash(python *)"
     ]
   }
 }

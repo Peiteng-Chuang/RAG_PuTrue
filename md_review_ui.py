@@ -1381,7 +1381,11 @@ def bump_widget_version():
 def commit_editor_if_dirty(file_key: str, page_idx: int) -> None:
     """讀 ace/text_area 在 session_state 中的最新值，若與 current_md 對應頁不同就 commit。
     取代舊版 text_area 的 on_change=commit_edit 流程，
-    讓 ace（無 on_change callback）跟 text_area 走同一條 commit 路徑。"""
+    讓 ace（無 on_change callback）跟 text_area 走同一條 commit 路徑。
+
+    編輯器只顯示去頁標頭（`## 第 N 頁`）與結尾分隔線（`---`）後的 body，
+    這裡再對稱地把這兩個結構錨點黏回去，確保頁錨點/分隔線不被使用者誤改。
+    比對在 stripped body 層級進行，避免空白差異造成每次 rerun 都誤判 dirty。"""
     if not file_key:
         return
     version = st.session_state.get("widget_version", 0)
@@ -1392,10 +1396,14 @@ def commit_editor_if_dirty(file_key: str, page_idx: int) -> None:
     _, _, pages_curr = parse_md(st.session_state.current_md)
     if page_idx >= len(pages_curr):
         return
-    _, current_page_md = pages_curr[page_idx]
-    if edited != current_page_md:
+    page_num, current_page_md = pages_curr[page_idx]
+    if edited.strip() != strip_page_header(current_page_md):
+        has_separator = re.search(r"\n-{3,}\s*\n?$", current_page_md) is not None
+        full_edited = f"## 第 {page_num} 頁\n{edited.strip()}\n"
+        if has_separator:
+            full_edited += "\n---\n"
         st.session_state.current_md = replace_page(
-            st.session_state.current_md, page_idx, edited
+            st.session_state.current_md, page_idx, full_edited
         )
         mark_processing(file_key)
 
@@ -2366,10 +2374,17 @@ with tab_pdf:
 
     with col_md:
         st.subheader("Markdown 內容（可編輯）")
+        # 頁標頭 `## 第 N 頁` 與頁尾分隔線 `---` 是結構錨點（Citation／頁面對映用），
+        # 不放進編輯器以免被誤改；commit 時由 commit_editor_if_dirty 自動黏回。
+        st.info(
+            f"本頁錨點 `## 第 {page_num} 頁` 已鎖定並自動保留，請從 `###` 標題開始編輯內文。",
+            icon="📌",
+        )
+        editor_body = strip_page_header(page_md)
         editor_key = editor_key_for(selected_key, current_idx, st.session_state.widget_version)
         if HAS_ACE:
             st_ace(
-                value=page_md,
+                value=editor_body,
                 language="markdown",
                 theme="chrome",
                 keybinding="vscode",      # Alt+↑/↓ 移行、Ctrl+Alt+↑/↓ 多游標等整套
@@ -2388,7 +2403,7 @@ with tab_pdf:
             )
             st.text_area(
                 "Page Markdown",
-                value=page_md,
+                value=editor_body,
                 height=600,
                 key=editor_key,
                 label_visibility="collapsed",

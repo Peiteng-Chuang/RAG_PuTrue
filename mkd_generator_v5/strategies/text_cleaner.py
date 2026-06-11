@@ -226,15 +226,43 @@ class SpanLevelTextCleaner(TextCleaner):
 
             # 1. 黑名單比對：先用 含 title 的原始文字（對齊 template scan 用 blocks 看到的）
             original_norm = re.sub(r"\s+", "", "".join(original_text_lines))
+            banned = False
             if original_norm in filter_state.blacklisted_regions:
-                banned = False
                 for b_box in filter_state.blacklisted_regions[original_norm]:
                     if (abs(x0 - b_box[0]) / page_w <= self.position_tolerance and
                             abs(y0 - b_box[1]) / page_h <= self.position_tolerance):
                         banned = True
                         break
-                if banned:
-                    continue
+
+            # 1b. Fallback：blocks↔dict 邊界切法不一致時的補抓
+            #
+            # PyMuPDF 對「左側細長 vertical text 條」這類版面，blocks 模式常會把整條當
+            # 一個 block，dict 模式卻拆成多個 sub-block（典型例：CAD/結構簡報的
+            # KAICHU 浮水印 + 頁首地號合在一個垂直區）。
+            #
+            # 結果：template scan（用 blocks）登錄的 key 是長串，cleaner（用 dict）
+            # 拼出來的 key 是其中一段，相等比對永遠 miss → 黑名單失效，每頁漏刪。
+            #
+            # 條件三件必滿足才視為命中，避免正文偶然撞到 banner 字片段被誤殺：
+            #   (a) original_norm 是 banned_key 的真子字串（且長度 >= 3）
+            #   (b) 當前 dict block 的 bbox 被 banned_key 對應的 banner bbox 包住
+            #   (c) 已經 contained，毋須再看 position_tolerance 偏移
+            if not banned and len(original_norm) >= 3:
+                tol = self.bbox_tolerance_pt
+                for banned_key, banned_bboxes in filter_state.blacklisted_regions.items():
+                    if banned_key == original_norm or original_norm not in banned_key:
+                        continue
+                    for b_box in banned_bboxes:
+                        bx0, by0, bx1, by1 = b_box
+                        if (bx0 - tol <= x0 and by0 - tol <= y0
+                                and bx1 + tol >= x1 and by1 + tol >= y1):
+                            banned = True
+                            break
+                    if banned:
+                        break
+
+            if banned:
+                continue
 
             # title 全部丟光 → 此 block 內容空，整塊 skip
             if not kept_text_lines:
