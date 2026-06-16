@@ -62,6 +62,7 @@ try:
         RAG_SYSTEM_PROMPT as LLM_RAG_SYSTEM_PROMPT,
         format_chunks as llm_format_chunks,
         generate_hyde as llm_generate_hyde,
+        generate_title as llm_generate_title,
     )
     HAS_OLLAMA = True
 except ImportError:
@@ -71,6 +72,7 @@ except ImportError:
     LLM_RAG_SYSTEM_PROMPT = ""
     llm_format_chunks = None
     llm_generate_hyde = None
+    llm_generate_title = None
     HAS_OLLAMA = False
 
 
@@ -78,6 +80,7 @@ except ImportError:
 DEFAULT_DATA_PATH = r"D:/璞真RAG資料夾/12.個案銷講資料"
 MKDATA_PATH = Path("./mkdata")
 TRACKER = MKDATA_PATH / "process_tracker.json"
+CHAT_STORE = MKDATA_PATH / "chat_sessions.json"  # 對話模式聊天紀錄持久化（F5 不遺失）
 PDF_CACHE_DIR = Path("./_compare_cache")
 TRASH_DIR = Path("./_md_trash")
 PDF_CACHE_DIR.mkdir(exist_ok=True)
@@ -1494,11 +1497,56 @@ if "sidecars" not in st.session_state:
     st.session_state.sidecars = {}
 
 # === View state（審閱模式 ↔ 對話模式）+ chat sessions 容器 ===
+def _save_chat_sessions() -> None:
+    """把 chat_sessions + active id 原子寫入 CHAT_STORE。
+
+    寫 tmp 再 os.replace，避免半寫壞檔（崩潰／F5 中途）覆蓋掉好檔。messages 內的
+    chunks 是 {"score": float, "payload": dict}，皆 JSON 可序列化。寫檔失敗只警告、
+    不中斷對話（持久化是加分功能，不該擋住主流程）。
+    """
+    try:
+        MKDATA_PATH.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "active": st.session_state.get("active_chat_session"),
+            "sessions": st.session_state.get("chat_sessions", {}),
+        }
+        tmp = CHAT_STORE.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(tmp, CHAT_STORE)
+    except Exception as e:  # noqa: BLE001 — 持久化失敗不可中斷對話
+        st.warning(f"聊天紀錄存檔失敗（本輪仍在記憶體中）：{e}")
+
+
+def _load_chat_sessions() -> tuple[dict, str | None]:
+    """從 CHAT_STORE 載回 (sessions, active_id)；檔不存在或壞檔回 ({}, None)。"""
+    if not CHAT_STORE.exists():
+        return {}, None
+    try:
+        data = json.loads(CHAT_STORE.read_text(encoding="utf-8"))
+        sessions = data.get("sessions", {}) or {}
+        active = data.get("active")
+        if not isinstance(sessions, dict):
+            return {}, None
+        if active not in sessions:
+            active = None
+        return sessions, active
+    except Exception as e:  # noqa: BLE001 — 壞檔不可中斷啟動
+        st.warning(f"聊天紀錄讀取失敗，將以空白開始：{e}")
+        return {}, None
+
+
 if "app_view" not in st.session_state:
     st.session_state.app_view = "review"
 if "chat_sessions" not in st.session_state:
     # chat_sessions[session_id] = {"title": str, "messages": [{"role","content"}], "last_chunks": [], "created": iso}
-    st.session_state.chat_sessions = {}
+    # 從磁碟載回（F5／重啟不遺失）
+    _loaded_sessions, _loaded_active = _load_chat_sessions()
+    st.session_state.chat_sessions = _loaded_sessions
+    st.session_state.active_chat_session = _loaded_active
 if "active_chat_session" not in st.session_state:
     st.session_state.active_chat_session = None
 
@@ -1512,6 +1560,7 @@ def _new_chat_session(title: str = "新對話") -> str:
         "created": now_iso(),
     }
     st.session_state.active_chat_session = sid
+    _save_chat_sessions()
     return sid
 
 
@@ -1670,48 +1719,91 @@ def _chat_image_gallery_dialog():
             st.image(str(ip), use_container_width=True)
 
 
+def _render_source_page_inline(source_path: Path, page: int, key_suffix: str,
+                                dpi: int = 144) -> None:
+    """伺服器端把來源檔的指定頁渲染成 PNG，內嵌顯示在網頁（同審閱模式做法）。
+
+    PDF 直接渲染；PPT/PPTX 先用 LibreOffice 轉 PDF（需 soffice，自動偵測）。bytes
+    經 HTTP 傳到瀏覽器 → 不論瀏覽器在哪台都看得到，不會像 os.startfile 開在 server 桌面。
+    另附「下載原始檔」鈕，讓使用者把 server 上的原檔抓到本機。
+    """
+    ext = source_path.suffix.lower()
+    try:
+        if ext == ".pdf":
+            pdf_path = source_path
+        elif ext in (".ppt", ".pptx"):
+            soffice = find_soffice()
+            if not soffice:
+                st.warning(
+                    "此檔為 PPT/PPTX，需 LibreOffice 才能在網頁預覽。"
+                    "請在 server 安裝 LibreOffice（Markdown／圖片預覽不受影響）。"
+                )
+                return
+            with st.spinner(f"轉換 {source_path.name} → PDF 中..."):
+                pdf_path = ensure_pdf(source_path, soffice)
+        else:
+            st.warning(f"不支援在網頁預覽的格式：`{ext}`")
+            return
+        with st.spinner(f"渲染 {source_path.name} 第 {page} 頁中..."):
+            png_bytes = render_pdf_page_png(pdf_path, page - 1, dpi=dpi)
+        st.image(png_bytes, use_container_width=True,
+                 caption=f"{source_path.name} · 第 {page} 頁")
+        try:
+            st.download_button(
+                "⬇ 下載原始檔",
+                data=source_path.read_bytes(),
+                file_name=source_path.name,
+                key=f"_dl_{key_suffix}",
+                use_container_width=True,
+            )
+        except Exception as e:  # noqa: BLE001 — 下載鈕失敗不影響預覽
+            st.caption(f"（下載鈕無法載入：{e}）")
+    except Exception as e:  # noqa: BLE001
+        st.error(f"預覽失敗：\n```\n{e}\n```")
+
+
 def _render_chunk_sources(
     chunks: list[dict],
     data_root: Path,
     btn_key_prefix: str,
 ) -> None:
     """渲染來源文件清單（per-assistant-message expander 用）。
-    每個 (file, page) 一行：檔名 + score + 🔗 link + 📂 開啟鈕。不含圖片
-    （圖片已在右側預覽 / dialog 顯示）。
+    每個 (file, page) 一行：檔名 + score + 📂 開啟鈕。按下「開啟」會在 server 渲染
+    該引用頁成 PNG 內嵌於網頁顯示（再按一次收合）。不含圖片（圖片已在右側預覽顯示）。
     """
     groups = _group_chunks_by_file_page(chunks)
     if not groups:
         st.caption("（無有效來源）")
         return
+    preview_state_key = f"{btn_key_prefix}_preview"  # 目前展開預覽的 (fk,pg) token
     for (fk, pg), info in groups.items():
         pdf_path = data_root / fk
+        safe_fk = fk.replace("/", "_").replace("\\", "_")
+        token = f"{safe_fk}|{pg}"
         row = st.columns([4, 2, 1], gap="small")
         with row[0]:
-            file_exists = pdf_path.exists()
-            if file_exists:
-                st.markdown(
-                    f"📄 [{Path(fk).name}]({pdf_path.as_uri()}) · P{pg}",
-                    help=str(pdf_path),
-                )
+            if pdf_path.exists():
+                st.markdown(f"📄 {Path(fk).name} · P{pg}", help=str(pdf_path))
             else:
                 st.markdown(f"📄 {Path(fk).name} · P{pg}  ⚠ 本機未找到")
         with row[1]:
             st.caption(f"`{info['project']}` · score `{info['max_score']:.3f}`")
         with row[2]:
-            safe_fk = fk.replace("/", "_").replace("\\", "_")
             open_key = f"{btn_key_prefix}_open_{safe_fk}_{pg}"
+            is_open = st.session_state.get(preview_state_key) == token
             if st.button(
-                "📂 開啟",
+                "📂 收合" if is_open else "📂 開啟",
                 key=open_key,
                 use_container_width=True,
                 disabled=not pdf_path.exists(),
-                help="用系統預設程式開啟此 PDF/PPT",
+                help="在網頁顯示此頁（再按一次收合）",
             ):
-                ok, msg = _open_local_file(pdf_path)
-                if ok:
-                    st.toast(msg, icon="📂")
-                else:
-                    st.toast(msg, icon="❌")
+                # toggle：按下開啟 → 記住此 token；已開著再按 → 收合
+                st.session_state[preview_state_key] = None if is_open else token
+                st.rerun()
+        # 展開中 → 在整列下方渲染頁面預覽
+        if st.session_state.get(preview_state_key) == token and pdf_path.exists():
+            _render_source_page_inline(pdf_path, pg, key_suffix=f"{btn_key_prefix}_{token}")
 
 
 def _render_chat_view() -> None:
@@ -1755,6 +1847,7 @@ def _render_chat_view() -> None:
                     disabled=is_active,
                 ):
                     st.session_state.active_chat_session = sid
+                    _save_chat_sessions()
                     st.rerun()
             with row[1]:
                 if st.button("🗑", key=f"_chat_del_{sid}",
@@ -1764,8 +1857,9 @@ def _render_chat_view() -> None:
                     if sid == active_sid:
                         next_sid = next(iter(sessions), None)
                         if next_sid is None:
-                            next_sid = _new_chat_session()
+                            next_sid = _new_chat_session()  # 內含存檔
                         st.session_state.active_chat_session = next_sid
+                    _save_chat_sessions()
                     st.rerun()
 
         st.divider()
@@ -1897,6 +1991,7 @@ def _render_chat_view() -> None:
             )
             if new_title and new_title != active_sess.get("title"):
                 active_sess["title"] = new_title.strip() or "新對話"
+                _save_chat_sessions()
                 # text_input change 會自動觸發 rerun，sidebar 隨之刷新
 
         st.caption(
@@ -2060,6 +2155,7 @@ def _render_chat_view() -> None:
                 "content": f"⚠️ LLM 呼叫失敗：`{e}`",
                 "chunks": rag_chunks,
             })
+            _save_chat_sessions()  # 失敗訊息也持久化（F5 不遺失上下文）
             st.rerun()
 
         active_sess["messages"].append({
@@ -2068,10 +2164,19 @@ def _render_chat_view() -> None:
             "chunks": rag_chunks,
         })
 
-        # auto-title：首輪用 q 前 20 字當 session title
+        # auto-title：首輪用 LLM 擷取第一題重點當 session title；失敗才 fallback 截字
         if active_sess.get("title") == "新對話" and len(active_sess["messages"]) == 2:
-            active_sess["title"] = q[:20] + ("…" if len(q) > 20 else "")
+            fallback_title = q[:20] + ("…" if len(q) > 20 else "")
+            title = ""
+            if llm_generate_title is not None:
+                try:
+                    with st.spinner("產生對話標題中..."):
+                        title = llm_generate_title(ollama_cli, active_model, q)
+                except Exception:
+                    title = ""  # LLM 失敗 → 用 fallback
+            active_sess["title"] = title or fallback_title
 
+        _save_chat_sessions()  # 每輪對話結束都存檔
         st.rerun()
 
 

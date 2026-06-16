@@ -69,6 +69,55 @@ def generate_hyde(
     return response["message"]["content"].strip()
 
 
+TITLE_SYSTEM_PROMPT = """你是對話標題產生器。使用者會給你他在一場對話中問的「第一個問題」，請你擷取其**核心重點**，產生一個精煉的繁體中文短標題。
+
+【規則】
+1. 6 ～ 15 個字，越精準越好；抓住主題名詞（案名、工項、文件類型等），去掉「請問」「我想知道」之類的贅語。
+2. 只輸出標題本身，**不要**加引號、句號、冒號、編號或任何說明文字。
+3. 不要輸出「標題：」之類的前綴，也不要換行。
+4. 若問題本身就很短，直接精煉它即可。"""
+
+
+def generate_title(
+    ollama_client: Client,
+    model_name: str,
+    first_question: str,
+    system_prompt: str = TITLE_SYSTEM_PROMPT,
+    options: Optional[Dict[str, Any]] = None,
+    max_chars: int = 20,
+) -> str:
+    """用 LLM 把使用者「第一個問題」濃縮成一個對話室標題（繁中、6-15 字）。
+
+    純 stateless 的一次性呼叫，不寫入任何 history。回傳已清洗（去引號／換行／前綴、
+    截長）的標題字串；若 LLM 回空字串，回傳空字串交由 caller 決定 fallback。
+    """
+    opts = options or {
+        "num_ctx": 2048,
+        "temperature": 0.3,
+        "top_p": 0.9,
+        "num_predict": 48,
+    }
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": first_question},
+    ]
+    response = ollama_client.chat(
+        model=model_name,
+        messages=messages,
+        options=opts,
+    )
+    raw = (response["message"]["content"] or "").strip()
+    # 清洗：取首行、去常見前綴與包裹引號
+    title = raw.splitlines()[0].strip() if raw else ""
+    for prefix in ("標題：", "標題:", "Title:", "title:"):
+        if title.startswith(prefix):
+            title = title[len(prefix):].strip()
+    title = title.strip().strip("「」『』\"'《》").strip()
+    if len(title) > max_chars:
+        title = title[:max_chars].rstrip() + "…"
+    return title
+
+
 def format_chunks(chunks: List[Dict[str, Any]]) -> str:
     """把檢索結果格式化成模型友善的 context 區塊。
 
