@@ -81,6 +81,7 @@ DEFAULT_DATA_PATH = r"D:/璞真RAG資料夾/12.個案銷講資料"
 MKDATA_PATH = Path("./mkdata")
 TRACKER = MKDATA_PATH / "process_tracker.json"
 CHAT_STORE = MKDATA_PATH / "chat_sessions.json"  # 對話模式聊天紀錄持久化（F5 不遺失）
+REVIEW_PASSWORD = "123456"  # 進入審閱模式（ETL 標記工具）的密碼鎖
 PDF_CACHE_DIR = Path("./_compare_cache")
 TRASH_DIR = Path("./_md_trash")
 PDF_CACHE_DIR.mkdir(exist_ok=True)
@@ -391,6 +392,25 @@ def mark_ingested(file_key: str) -> None:
     sidecar.pop("prior_status", None)
     sidecar.pop("disk_dirty", None)
     persist_review_state(file_key)
+
+
+def set_status_on_disk(file_key: str, sidecar: dict, status: str) -> None:
+    """批次（fast pipeline）用：直接改 sidecar dict 的 review_status 並寫盤。
+
+    與 mark_encoded/mark_ingested 不同 —— 那些依賴 st.session_state.sidecars（只有
+    『目前開啟的檔』才在裡面），對未開啟的檔會 no-op。批次處理的是磁碟上的檔，
+    必須走這條 disk-direct 路徑。傳入的 sidecar 應為 load_sidecar() 取得的同一份。
+    """
+    sidecar["review_status"] = status
+    if status == "ingested":
+        sidecar["reviewed_at"] = now_iso()
+    sidecar.pop("prior_status", None)
+    sidecar.pop("disk_dirty", None)
+    save_sidecar(file_key, sidecar)
+    # 若該檔剛好也開在前景，同步 session_state 副本避免狀態列顯示過時
+    mem = st.session_state.get("sidecars", {}).get(file_key)
+    if mem is not None:
+        mem["review_status"] = status
 
 
 def persist_review_state(file_key: str) -> None:
@@ -992,6 +1012,45 @@ def build_all_chunks_for_doc(
     return out
 
 
+def build_chunks_from_disk(
+    file_key: str, image_root: Path, data_path: Path,
+) -> tuple[list[dict], dict]:
+    """純從磁碟（{stem}.md + sidecar）重建某檔全部 chunks，**不依賴 session_state**
+    的編輯緩衝，供 fast pipeline 批次處理未開啟的檔使用。
+
+    與互動流程一致地 lazy 計算缺失的 file_hash（從原始 PDF/PPT），並把標籤／切分設定
+    從 sidecar 還原（sidecar 用 str key 存 pages，這裡轉回 int key）。
+    回 (all_chunks, sidecar)；sidecar 為這次用到的同一份 dict（可接續寫狀態）。
+    """
+    md_path = derive_md_path(file_key)
+    md_text = md_path.read_text(encoding="utf-8")
+    _, _, pages = parse_md(md_text)
+    sidecar = load_sidecar(file_key)
+    if not sidecar.get("file_hash"):
+        sidecar["file_hash"] = compute_file_hash(data_path / file_key)
+        save_sidecar(file_key, sidecar)
+    stem = Path(split_key_parts(file_key)[-1]).stem
+    h1 = extract_h1(md_text, stem)
+    cl = sidecar.get("custom_labels", {"document": [], "pages": {}})
+    file_labels = {
+        "document": list(cl.get("document", [])),
+        "pages": {int(k): list(v) for k, v in cl.get("pages", {}).items()},
+    }
+    split_cfg = dict(sidecar.get("split_settings", {"mode": "delimiter", "delim": "\\n"}))
+    chunks = build_all_chunks_for_doc(
+        file_key=file_key,
+        sidecar=sidecar,
+        pages=pages,
+        page_md_override=None,
+        h1=h1,
+        doc_labels=file_labels["document"],
+        file_labels=file_labels,
+        split_cfg=split_cfg,
+        image_root=image_root,
+    )
+    return chunks, sidecar
+
+
 # === Embedding 快取（mkdata/{stem}.vectors.* 三件套）===
 def derive_vector_paths(file_key: str) -> dict:
     file_name = split_key_parts(file_key)[-1]
@@ -1540,7 +1599,7 @@ def _load_chat_sessions() -> tuple[dict, str | None]:
 
 
 if "app_view" not in st.session_state:
-    st.session_state.app_view = "review"
+    st.session_state.app_view = "chat"  # 預設進對話模式（審閱模式需密碼解鎖）
 if "chat_sessions" not in st.session_state:
     # chat_sessions[session_id] = {"title": str, "messages": [{"role","content"}], "last_chunks": [], "created": iso}
     # 從磁碟載回（F5／重啟不遺失）
@@ -1549,6 +1608,22 @@ if "chat_sessions" not in st.session_state:
     st.session_state.active_chat_session = _loaded_active
 if "active_chat_session" not in st.session_state:
     st.session_state.active_chat_session = None
+
+
+def _chat_fail(active_sess: dict, text: str, chunks: list | None = None) -> None:
+    """送出流程失敗時：append 一則 assistant 錯誤泡泡 + 存檔 + rerun。
+
+    取代原本散落的 st.error + st.stop()。好處：(1) 失敗也有可見且持久化的回覆，
+    (2) 絕不留「結尾是 user、無 assistant」的孤兒訊息毒化下一輪。rerun 後 chat_input
+    已清空 → 不會重跑送出區，無迴圈風險。
+    """
+    active_sess["messages"].append({
+        "role": "assistant",
+        "content": text,
+        "chunks": chunks or [],
+    })
+    _save_chat_sessions()
+    st.rerun()
 
 
 def _new_chat_session(title: str = "新對話") -> str:
@@ -1836,7 +1911,7 @@ def _render_chat_view() -> None:
             is_active = (sid == active_sid)
             label = sess.get("title", "新對話")
             n_msg = len(sess.get("messages", []))
-            row = st.columns([5, 1], gap="small")
+            row = st.columns([4, 1, 1], gap="small")
             with row[0]:
                 btn_label = f"{'📌 ' if is_active else '   '}{label}  ({n_msg})"
                 if st.button(
@@ -1850,9 +1925,18 @@ def _render_chat_view() -> None:
                     _save_chat_sessions()
                     st.rerun()
             with row[1]:
+                if st.button("✏️", key=f"_chat_rename_{sid}",
+                             help="重新命名此對話", use_container_width=True):
+                    # toggle 編輯狀態（再按一次收起）
+                    cur = st.session_state.get("_chat_editing")
+                    st.session_state["_chat_editing"] = None if cur == sid else sid
+                    st.rerun()
+            with row[2]:
                 if st.button("🗑", key=f"_chat_del_{sid}",
                              help="刪除此對話", use_container_width=True):
                     sessions.pop(sid, None)
+                    if st.session_state.get("_chat_editing") == sid:
+                        st.session_state["_chat_editing"] = None
                     # 若刪掉的是 active，切到第一個剩下的；都沒了就開新的
                     if sid == active_sid:
                         next_sid = next(iter(sessions), None)
@@ -1861,6 +1945,28 @@ def _render_chat_view() -> None:
                         st.session_state.active_chat_session = next_sid
                     _save_chat_sessions()
                     st.rerun()
+            # 點鉛筆 → 行下方展開改名輸入
+            if st.session_state.get("_chat_editing") == sid:
+                ed = st.columns([4, 1, 1], gap="small")
+                with ed[0]:
+                    new_name = st.text_input(
+                        "新名稱", value=label,
+                        key=f"_chat_rename_input_{sid}",
+                        label_visibility="collapsed",
+                        placeholder="輸入對話名稱",
+                    )
+                with ed[1]:
+                    if st.button("✓", key=f"_chat_rename_save_{sid}",
+                                 help="儲存", use_container_width=True):
+                        sess["title"] = new_name.strip() or "新對話"
+                        st.session_state["_chat_editing"] = None
+                        _save_chat_sessions()
+                        st.rerun()
+                with ed[2]:
+                    if st.button("✕", key=f"_chat_rename_cancel_{sid}",
+                                 help="取消", use_container_width=True):
+                        st.session_state["_chat_editing"] = None
+                        st.rerun()
 
         st.divider()
 
@@ -1978,21 +2084,8 @@ def _render_chat_view() -> None:
     col_chat, col_imgs = st.columns([2, 1], gap="large")
 
     with col_chat:
-        # === 標題：可改名 text_input，變更同步到 active session ===
-        title_row = st.columns([1, 20])
-        with title_row[0]:
-            st.markdown("### 💬")
-        with title_row[1]:
-            new_title = st.text_input(
-                "對話標題",
-                value=active_sess.get("title", "新對話"),
-                key=f"_chat_title_main_{active_sid}",
-                label_visibility="collapsed",
-            )
-            if new_title and new_title != active_sess.get("title"):
-                active_sess["title"] = new_title.strip() or "新對話"
-                _save_chat_sessions()
-                # text_input change 會自動觸發 rerun，sidebar 隨之刷新
+        # === 標題（唯讀顯示）：改名改到左側「對話 Session」清單的 ✏️ 鈕 ===
+        st.markdown(f"### 💬 {active_sess.get('title', '新對話')}")
 
         st.caption(
             f"Model: `{active_model}` · HyDE: {'on' if sb_hyde else 'off'} · "
@@ -2076,24 +2169,20 @@ def _render_chat_view() -> None:
         rag_chunks: list[dict] = []
         if sb_rag_on:
             if not HAS_QDRANT:
-                st.error("RAG on 但 qdrant-client 未安裝。請關掉 RAG 或裝 qdrant-client。")
-                st.stop()
+                _chat_fail(active_sess, "⚠️ RAG on 但 `qdrant-client` 未安裝。請關掉 RAG 或安裝 qdrant-client。")
             try:
                 cli = get_qdrant_client(sb_qdrant_url, sb_qdrant_key)
             except Exception as e:
-                st.error(f"Qdrant 連線失敗：\n```\n{e}\n```")
-                st.stop()
+                _chat_fail(active_sess, f"⚠️ Qdrant 連線失敗：\n```\n{e}\n```")
             if not cli.collection_exists(sb_qdrant_coll):
-                st.error(f"Collection `{sb_qdrant_coll}` 不存在")
-                st.stop()
+                _chat_fail(active_sess, f"⚠️ Collection `{sb_qdrant_coll}` 不存在")
             try:
                 embedder = load_embedder(
                     st.session_state.get("embed_model", EMBEDDING_MODEL),
                     st.session_state.get("embed_fp16", True),
                 )
             except Exception as e:
-                st.error(f"Embedder 載入失敗：\n```\n{e}\n```")
-                st.stop()
+                _chat_fail(active_sess, f"⚠️ Embedder 載入失敗：\n```\n{e}\n```")
 
             ollama_cli = OllamaClient(host=sb_ollama_url)
 
@@ -2107,15 +2196,18 @@ def _render_chat_view() -> None:
                     st.warning(f"HyDE 失敗，fallback 用原 query：{e}")
                     embed_query_text = q
 
-            # 3. encode + search
-            with st.spinner(f"檢索中（{sb_search_mode} top-{sb_top_k}）..."):
-                q_dense, q_sparse = encode_query(embedder, embed_query_text)
-                if sb_search_mode == "dense":
-                    hits = search_dense(cli, sb_qdrant_coll, q_dense, int(sb_top_k), None)
-                elif sb_search_mode == "sparse":
-                    hits = search_sparse(cli, sb_qdrant_coll, q_sparse, int(sb_top_k), None)
-                else:
-                    hits = search_hybrid(cli, sb_qdrant_coll, q_dense, q_sparse, int(sb_top_k), None)
+            # 3. encode + search（失敗也走 _chat_fail，不留孤兒 user）
+            try:
+                with st.spinner(f"檢索中（{sb_search_mode} top-{sb_top_k}）..."):
+                    q_dense, q_sparse = encode_query(embedder, embed_query_text)
+                    if sb_search_mode == "dense":
+                        hits = search_dense(cli, sb_qdrant_coll, q_dense, int(sb_top_k), None)
+                    elif sb_search_mode == "sparse":
+                        hits = search_sparse(cli, sb_qdrant_coll, q_sparse, int(sb_top_k), None)
+                    else:
+                        hits = search_hybrid(cli, sb_qdrant_coll, q_dense, q_sparse, int(sb_top_k), None)
+            except Exception as e:
+                _chat_fail(active_sess, f"⚠️ 檢索失敗：\n```\n{e}\n```")
             rag_chunks = [{"score": h.score, "payload": h.payload or {}} for h in hits]
         else:
             ollama_cli = OllamaClient(host=sb_ollama_url)
@@ -2125,6 +2217,10 @@ def _render_chat_view() -> None:
         messages = [{"role": "system", "content": sys_prompt}]
         # 歷史（不含剛加的 user msg）
         prior = active_sess["messages"][:-1]
+        # 防呆：剝除結尾孤兒 user（無對應 assistant），避免送出連續兩個 user role
+        # 導致部分模型回空字串。正常交替歷史結尾為 assistant → 此迴圈不觸發、零 context 損失。
+        while prior and prior[-1].get("role") == "user":
+            prior = prior[:-1]
         messages.extend(prior[-10:])  # 保留近 5 輪（user+assistant）
         if rag_chunks:
             ctx_text = llm_format_chunks(rag_chunks)
@@ -2150,13 +2246,11 @@ def _render_chat_view() -> None:
                 )
             answer = resp["message"]["content"]
         except Exception as e:
-            active_sess["messages"].append({
-                "role": "assistant",
-                "content": f"⚠️ LLM 呼叫失敗：`{e}`",
-                "chunks": rag_chunks,
-            })
-            _save_chat_sessions()  # 失敗訊息也持久化（F5 不遺失上下文）
-            st.rerun()
+            _chat_fail(active_sess, f"⚠️ LLM 呼叫失敗：`{e}`", chunks=rag_chunks)
+
+        # 空回答防呆：模型偶爾回空字串（num_predict 太小／上下文異常）→ 別塞空白泡泡
+        if not (answer or "").strip():
+            answer = "⚠️ 模型回傳空內容（可能 num_predict 太小或上下文異常）。請重試，或調整 num_predict／檢查對話歷史。"
 
         active_sess["messages"].append({
             "role": "assistant",
@@ -2164,14 +2258,19 @@ def _render_chat_view() -> None:
             "chunks": rag_chunks,
         })
 
-        # auto-title：首輪用 LLM 擷取第一題重點當 session title；失敗才 fallback 截字
-        if active_sess.get("title") == "新對話" and len(active_sess["messages"]) == 2:
-            fallback_title = q[:20] + ("…" if len(q) > 20 else "")
+        # auto-title：title 仍是預設「新對話」就用「第一則 user 問題」生成重點標題；
+        # 用第一則 user（非本輪 q）→ 即使前面有錯誤turn，首次成功回答後仍能正確命名。
+        if active_sess.get("title") == "新對話":
+            first_user = next(
+                (m["content"] for m in active_sess["messages"] if m.get("role") == "user"),
+                q,
+            )
+            fallback_title = first_user[:20] + ("…" if len(first_user) > 20 else "")
             title = ""
             if llm_generate_title is not None:
                 try:
                     with st.spinner("產生對話標題中..."):
-                        title = llm_generate_title(ollama_cli, active_model, q)
+                        title = llm_generate_title(ollama_cli, active_model, first_user)
                 except Exception:
                     title = ""  # LLM 失敗 → 用 fallback
             active_sess["title"] = title or fallback_title
@@ -2199,6 +2298,24 @@ with _topbar_cols[1]:
 
 if st.session_state.app_view == "chat":
     _render_chat_view()
+    st.stop()
+
+# === 審閱模式密碼鎖（解鎖後本 session 維持解鎖）===
+if not st.session_state.get("review_unlocked", False):
+    st.title("🔒 審閱模式")
+    st.caption("審閱模式為 ETL 標記工具，需密碼進入。")
+    with st.form("_review_unlock_form"):
+        pw = st.text_input("請輸入密碼", type="password")
+        submitted = st.form_submit_button("解鎖", type="primary")
+    if submitted:
+        if pw == REVIEW_PASSWORD:
+            st.session_state.review_unlocked = True
+            st.rerun()
+        else:
+            st.error("密碼錯誤")
+    if st.button("← 返回對話模式", key="_review_lock_back"):
+        st.session_state.app_view = "chat"
+        st.rerun()
     st.stop()
 
 # review 模式才顯示原標題
@@ -2287,6 +2404,161 @@ with st.sidebar:
         "Collection 名稱", value=QDRANT_TEXT_COLLECTION,
         help="預設對齊 qdrant格式.md §2。改動代表寫到別的 collection",
     )
+
+    # ============================================================
+    # fast pipeline：全庫批次 encode → Qdrant
+    # ============================================================
+    st.divider()
+    st.subheader("⚡ fast pipeline")
+
+    # 上一次批次結果（rerun 後才顯示，避免被 st.rerun 清掉）
+    _fp_report = st.session_state.pop("_fastpipe_report", None)
+    if _fp_report:
+        (st.error if "失敗" in _fp_report else st.success)(_fp_report)
+
+    _fp_non_ingested = [fk for fk in file_keys if _file_status_map.get(fk) != "ingested"]
+    _fp_encoded = [fk for fk in file_keys if _file_status_map.get(fk) == "encoded"]
+    st.caption(
+        f"非已入庫：**{len(_fp_non_ingested)}** 檔（可 embedding）｜"
+        f"已 encode 待入庫：**{len(_fp_encoded)}** 檔"
+    )
+    st.caption(
+        "⚠️ 批次會**跳過逐頁審閱關卡**，並使用**磁碟上已存檔的 md**（非未存的編輯緩衝）。"
+    )
+    _fp_confirm = st.checkbox(
+        "我已確認上述 md 審閱完畢，可批次處理",
+        key="_fastpipe_confirm",
+    )
+
+    # 模型參數沿用 Tab 4 的設定（session_state），首次未開 Tab 4 時用預設
+    _fp_model = st.session_state.get("embed_model", EMBEDDING_MODEL)
+    _fp_bs = int(st.session_state.get("embed_batch", 32))
+    _fp_fp16 = bool(st.session_state.get("embed_fp16", True))
+
+    fp_cols = st.columns(2)
+
+    # ---- [一鍵 embedding] ----
+    with fp_cols[0]:
+        if st.button(
+            "🧬 一鍵 embedding",
+            type="primary",
+            use_container_width=True,
+            disabled=(not _fp_confirm) or (len(_fp_non_ingested) == 0),
+            help=f"對 {len(_fp_non_ingested)} 個非已入庫檔批次 encode（已有有效快取者自動跳過）",
+            key="_fastpipe_embed_btn",
+        ):
+            try:
+                _embedder = load_embedder(_fp_model, _fp_fp16)
+            except Exception as e:
+                st.session_state["_fastpipe_report"] = f"⚡ 一鍵 embedding 失敗：模型載入錯誤 {e}"
+                st.rerun()
+            n_enc = n_cache = n_empty = n_nohash = 0
+            fails: list[str] = []
+            n = len(_fp_non_ingested)
+            prog = st.progress(0.0, text="準備中...")
+            for fi, fk in enumerate(_fp_non_ingested):
+                prog.progress(fi / n, text=f"[{fi+1}/{n}] {Path(fk).name}")
+                try:
+                    chunks, sc = build_chunks_from_disk(fk, image_root, data_path)
+                    ids = [c["id"] for c in chunks]
+                    if not ids:
+                        n_empty += 1
+                        continue
+                    if not sc.get("file_hash"):
+                        n_nohash += 1  # 空 hash 會導致跨檔 point-id 碰撞，跳過
+                        fails.append(f"{Path(fk).name}: file_hash 為空（原始檔找不到？）")
+                        continue
+                    if vector_cache_status(fk, sc, ids)["valid"]:
+                        n_cache += 1
+                        # 已有有效快取 = 已 embedding；非 ingested 就統一標成 encoded，
+                        # 讓「更新資料庫」能接手上傳（processing/unprocessed 都收斂過來）
+                        if _file_status_map.get(fk) != "encoded":
+                            set_status_on_disk(fk, sc, "encoded")
+                        continue
+                    texts = [c["payload"]["content"]["text_with_prefix"] for c in chunks]
+                    dparts, sall = [], []
+                    for s in range(0, len(texts), _fp_bs):
+                        d, sp = encode_chunks(_embedder, texts[s:s + _fp_bs], batch_size=_fp_bs)
+                        dparts.append(d)
+                        sall.extend(sp)
+                    save_vectors(fk, sc, ids, np.concatenate(dparts, axis=0), sall, fp16=_fp_fp16)
+                    set_status_on_disk(fk, sc, "encoded")
+                    n_enc += 1
+                except Exception as e:
+                    fails.append(f"{Path(fk).name}: {e}")
+            prog.empty()
+            rep = (
+                f"⚡ 一鍵 embedding 完成：新 encode **{n_enc}** · 已快取跳過 **{n_cache}** · "
+                f"空檔 {n_empty} · 無 hash 跳過 {n_nohash}"
+            )
+            if fails:
+                rep += f"\n\n失敗 {len(fails)} 檔：\n- " + "\n- ".join(fails[:10])
+                if len(fails) > 10:
+                    rep += f"\n- …另 {len(fails) - 10} 檔"
+            st.session_state["_fastpipe_report"] = rep
+            st.rerun()
+
+    # ---- [更新資料庫] ----
+    with fp_cols[1]:
+        if st.button(
+            "🗄 更新資料庫",
+            use_container_width=True,
+            disabled=(not _fp_confirm) or (len(_fp_encoded) == 0) or (not HAS_QDRANT),
+            help=f"把 {len(_fp_encoded)} 個已 encode 檔上傳到 Qdrant collection `{qdrant_collection_name}`",
+            key="_fastpipe_upsert_btn",
+        ):
+            try:
+                _qcli = get_qdrant_client(qdrant_url, qdrant_api_key)
+                ensure_text_collection(_qcli, qdrant_collection_name, recreate=False)
+            except Exception as e:
+                st.session_state["_fastpipe_report"] = f"⚡ 更新資料庫失敗：Qdrant 連線/建表錯誤 {e}"
+                st.rerun()
+            n_up = n_skip_invalid = n_mismatch = n_empty = 0
+            n_pts = 0
+            fails = []
+            n = len(_fp_encoded)
+            prog = st.progress(0.0, text="準備中...")
+            for fi, fk in enumerate(_fp_encoded):
+                prog.progress(fi / n, text=f"[{fi+1}/{n}] {Path(fk).name}")
+                try:
+                    chunks, sc = build_chunks_from_disk(fk, image_root, data_path)
+                    ids = [c["id"] for c in chunks]
+                    if not ids:
+                        n_empty += 1
+                        continue
+                    if not sc.get("file_hash"):
+                        n_mismatch += 1  # 空 hash → 跨檔 point-id 碰撞風險，拒絕上傳
+                        fails.append(f"{Path(fk).name}: file_hash 為空，拒絕上傳（避免覆蓋他檔）")
+                        continue
+                    if not vector_cache_status(fk, sc, ids)["valid"]:
+                        n_skip_invalid += 1
+                        fails.append(f"{Path(fk).name}: 快取失效，需重新 encode")
+                        continue
+                    dense, sparse, manifest = load_cached_vectors(fk)
+                    if manifest.get("chunk_ids") != ids:
+                        n_mismatch += 1
+                        fails.append(f"{Path(fk).name}: 快取 chunk_ids 與當前 chunks 不一致")
+                        continue
+                    points = build_points_for_upsert(chunks, dense, sparse, now_iso())
+                    upsert_in_batches(
+                        _qcli, qdrant_collection_name, points, batch_size=QDRANT_BATCH_SIZE,
+                    )
+                    set_status_on_disk(fk, sc, "ingested")
+                    n_up += 1
+                    n_pts += len(points)
+                except Exception as e:
+                    fails.append(f"{Path(fk).name}: {e}")
+            prog.empty()
+            rep = (
+                f"⚡ 更新資料庫完成：上傳 **{n_up}** 檔 / {n_pts} points → 🔵 已入庫 · "
+                f"快取失效跳過 {n_skip_invalid} · 不一致 {n_mismatch} · 空檔 {n_empty}"
+            )
+            if fails:
+                rep += f"\n\n問題 {len(fails)} 檔：\n- " + "\n- ".join(fails[:10])
+                if len(fails) > 10:
+                    rep += f"\n- …另 {len(fails) - 10} 檔"
+            st.session_state["_fastpipe_report"] = rep
+            st.rerun()
 
     st.divider()
     st.caption("提示：編輯區失焦（Tab/點擊外部）後才會自動同步到完整 md。"
