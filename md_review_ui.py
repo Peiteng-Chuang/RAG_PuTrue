@@ -1197,8 +1197,13 @@ def clear_vector_cache(file_key: str) -> int:
     return n
 
 
-def _load_embedder_impl(model_name: str, use_fp16: bool):
-    """實際載入 BGEM3FlagModel（純函式、不碰 streamlit；供前景與背景執行緒共用）。"""
+@st.cache_resource(show_spinner="載入 bge-m3 中（首次需 ~15s）...")
+def load_embedder(model_name: str, use_fp16: bool):
+    """快取整個 BGEM3FlagModel 物件（cache_resource = 行程內單例），避免每次 rerun 重載。
+
+    必須在 Streamlit 主執行緒（ScriptRunner）載入並使用：PyTorch/CUDA 模型若在
+    背景執行緒建立、卻在主執行緒推理，會 segfault / CUDA error / 重複載入 OOM，
+    直接讓整個行程死掉（曾因背景預載踩到此雷）。故一律前景同步載入。"""
     try:
         from FlagEmbedding import BGEM3FlagModel
     except ImportError as e:
@@ -1208,67 +1213,6 @@ def _load_embedder_impl(model_name: str, use_fp16: bool):
             "（依賴 peft / accelerate，第一次裝約 100MB）"
         ) from e
     return BGEM3FlagModel(model_name, use_fp16=use_fp16)
-
-
-# === bge-m3 背景預載（底層斷線治本 #2）===
-# 問題：bge-m3 首次載入 ~15-60s 是一段「無法串流」的同步阻塞。若放在對話送出的
-# rerun 裡，那段 websocket 零流量 → 被部屬層 idle timeout 剪斷（= 使用者回報的
-# 「初始對話載入 bge-m3 時中斷」）。對策：開機就在背景執行緒把模型載好，請求路徑
-# 上只做「就緒檢查」，未就緒時靠輪詢 rerun（產生流量）等待，永不長阻塞主執行緒。
-# 背景執行緒**絕不呼叫任何 st.* API**（無 ScriptRunContext），只回傳模型物件。
-import threading
-
-_EMBEDDER_BG: dict = {"model": None, "loading": False, "error": "", "key": None}
-_EMBEDDER_BG_LOCK = threading.Lock()
-
-
-def start_embedder_warmup(model_name: str, use_fp16: bool) -> None:
-    """冪等地在背景執行緒預載 embedder。已載好／載入中／同 key 則 no-op。"""
-    key = (model_name, use_fp16)
-    with _EMBEDDER_BG_LOCK:
-        same = _EMBEDDER_BG["key"] == key
-        if same and (_EMBEDDER_BG["model"] is not None or _EMBEDDER_BG["loading"]):
-            return
-        _EMBEDDER_BG.update({"model": None, "loading": True, "error": "", "key": key})
-
-    def _run():
-        model, err = None, ""
-        try:
-            model = _load_embedder_impl(model_name, use_fp16)
-        except Exception as e:  # noqa: BLE001 — 背景載入失敗，狀態回報給前景
-            err = str(e)
-        with _EMBEDDER_BG_LOCK:
-            if _EMBEDDER_BG["key"] == key:
-                _EMBEDDER_BG.update({"model": model, "error": err, "loading": False})
-
-    threading.Thread(target=_run, daemon=True, name="bge-m3-warmup").start()
-
-
-def get_warm_embedder(model_name: str, use_fp16: bool):
-    """回背景已預載好的 embedder；尚未就緒回 None。"""
-    with _EMBEDDER_BG_LOCK:
-        if _EMBEDDER_BG["key"] == (model_name, use_fp16):
-            return _EMBEDDER_BG["model"]
-    return None
-
-
-def embedder_warm_error(model_name: str, use_fp16: bool) -> str:
-    with _EMBEDDER_BG_LOCK:
-        if _EMBEDDER_BG["key"] == (model_name, use_fp16):
-            return _EMBEDDER_BG["error"]
-    return ""
-
-
-@st.cache_resource(show_spinner="載入 bge-m3 中（首次需 ~15s）...")
-def load_embedder(model_name: str, use_fp16: bool):
-    """快取整個 BGEM3FlagModel 物件，避免每次 rerun 重載。
-
-    若背景預載（start_embedder_warmup）已備妥同款模型，直接沿用、零等待；
-    否則前景載入（批次 Tab 等非對話路徑的 fallback）。"""
-    warm = get_warm_embedder(model_name, use_fp16)
-    if warm is not None:
-        return warm
-    return _load_embedder_impl(model_name, use_fp16)
 
 
 def encode_chunks(
@@ -1736,13 +1680,6 @@ if "chat_sessions" not in st.session_state:
     st.session_state.active_chat_session = _loaded_active
 if "active_chat_session" not in st.session_state:
     st.session_state.active_chat_session = None
-
-# 開機即在背景預載 bge-m3：讓首次對話前模型多半已就緒，把那段無法串流的長阻塞
-# 移出請求路徑（見 start_embedder_warmup 註解）。daemon 執行緒、非阻塞、冪等。
-start_embedder_warmup(
-    st.session_state.get("embed_model", EMBEDDING_MODEL),
-    st.session_state.get("embed_fp16", True),
-)
 
 
 def _chat_fail(active_sess: dict, text: str, chunks: list | None = None) -> None:
@@ -2298,25 +2235,6 @@ def _render_chat_view() -> None:
                     st.session_state["_chat_dialog_metas"] = all_metas
                     _chat_image_gallery_dialog()
 
-    # ---- 背景模型就緒前的輪詢等待 ----
-    # 提問因 bge-m3 仍在背景載入而被暫存時，每次 rerun 在這裡檢查就緒狀態：
-    # 未就緒就顯示進度 + 短 sleep + rerun（這個 rerun 本身就是 websocket 流量，
-    # 讓連線在 15–60s 載入期不致 idle 斷線）；就緒則取回暫存提問當本輪 user_q 續送。
-    if not (user_q and user_q.strip()) and st.session_state.get("_pending_chat_q"):
-        _pem = st.session_state.get("embed_model", EMBEDDING_MODEL)
-        _pfp = st.session_state.get("embed_fp16", True)
-        _perr = embedder_warm_error(_pem, _pfp)
-        if _perr:
-            st.session_state.pop("_pending_chat_q", None)
-            _chat_fail(active_sess, f"⚠️ Embedder 載入失敗：\n```\n{_perr}\n```")
-        elif get_warm_embedder(_pem, _pfp) is None:
-            with live_turn:
-                st.info("🔧 首次啟動：背景載入 bge-m3 向量模型中（約 15–60s），就緒後會自動送出您的問題…")
-            time.sleep(1.5)
-            st.rerun()
-        else:
-            user_q = st.session_state.pop("_pending_chat_q")
-
     # ---- 送出處理 ----
     if user_q and user_q.strip():
         q = user_q.strip()
@@ -2340,21 +2258,17 @@ def _render_chat_view() -> None:
                 _chat_fail(active_sess, f"⚠️ Qdrant 連線失敗：\n```\n{e}\n```")
             if not cli.collection_exists(sb_qdrant_coll):
                 _chat_fail(active_sess, f"⚠️ Collection `{sb_qdrant_coll}` 不存在")
-            # Embedder 就緒檢查（非阻塞）：背景已預載好→直接用；還在載→撤回本輪提問、
-            # 暫存後輪詢等待，不在請求路徑上做那段「無法串流」的長阻塞（避免 websocket
-            # idle 被部屬層剪斷 = 使用者回報的「初始對話載入 bge-m3 時中斷」）。
-            _em = st.session_state.get("embed_model", EMBEDDING_MODEL)
-            _fp = st.session_state.get("embed_fp16", True)
-            start_embedder_warmup(_em, _fp)
-            embedder = get_warm_embedder(_em, _fp)
-            if embedder is None:
-                _werr = embedder_warm_error(_em, _fp)
-                if _werr:
-                    _chat_fail(active_sess, f"⚠️ Embedder 載入失敗：\n```\n{_werr}\n```")
-                if active_sess["messages"] and active_sess["messages"][-1].get("role") == "user":
-                    active_sess["messages"].pop()
-                st.session_state["_pending_chat_q"] = q
-                st.rerun()
+            # Embedder：前景（主執行緒）載入，cache_resource 確保只載一次。首次 ~15-60s
+            # 同步阻塞於此（這是安全的 —— GPU 模型必須在主執行緒載入/推理，詳見
+            # load_embedder 註解）。若首次載入期間發生 websocket 斷線，屬部屬層 idle
+            # timeout 問題，請放寬 proxy 逾時或採獨立行程方案，勿改回背景執行緒。
+            try:
+                embedder = load_embedder(
+                    st.session_state.get("embed_model", EMBEDDING_MODEL),
+                    st.session_state.get("embed_fp16", True),
+                )
+            except Exception as e:
+                _chat_fail(active_sess, f"⚠️ Embedder 載入失敗：\n```\n{e}\n```")
 
             ollama_cli = get_ollama_client(sb_ollama_url)
 
