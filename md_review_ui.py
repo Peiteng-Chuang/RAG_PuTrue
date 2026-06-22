@@ -1197,13 +1197,16 @@ def clear_vector_cache(file_key: str) -> int:
     return n
 
 
-@st.cache_resource(show_spinner="載入 bge-m3 中（首次需 ~15s）...")
-def load_embedder(model_name: str, use_fp16: bool):
+@st.cache_resource(show_spinner="載入 bge-m3 中（CPU 約 2-3s）...")
+def load_embedder(model_name: str, use_fp16: bool, device: str = "cpu"):
     """快取整個 BGEM3FlagModel 物件（cache_resource = 行程內單例），避免每次 rerun 重載。
 
-    必須在 Streamlit 主執行緒（ScriptRunner）載入並使用：PyTorch/CUDA 模型若在
-    背景執行緒建立、卻在主執行緒推理，會 segfault / CUDA error / 重複載入 OOM，
-    直接讓整個行程死掉（曾因背景預載踩到此雷）。故一律前景同步載入。"""
+    device="cpu"（預設）：互動端 RTX 2050 等小顯存卡的唯一安全選擇。CPU 載入 bge-m3
+    約 2-3s、單句 encode <1s，互動查詢綽綽有餘。
+    device="cuda"：需 ≳6GB 空閒顯存。4GB 卡（2050）在 Streamlit 行程內載入 bge-m3 會
+    CUDA OOM 讓**整個行程直接 abort**（終端無 traceback 死掉），故非預設、勿在小卡上開。
+
+    另：必須主執行緒（ScriptRunner）載入並使用 —— GPU 模型跨執行緒建立/推理會崩潰。"""
     try:
         from FlagEmbedding import BGEM3FlagModel
     except ImportError as e:
@@ -1212,6 +1215,9 @@ def load_embedder(model_name: str, use_fp16: bool):
             "    pip install -U FlagEmbedding\n"
             "（依賴 peft / accelerate，第一次裝約 100MB）"
         ) from e
+    if device == "cpu":
+        # fp16 在 CPU 無意義且部分算子不支援 → 強制 fp32
+        return BGEM3FlagModel(model_name, use_fp16=False, devices="cpu")
     return BGEM3FlagModel(model_name, use_fp16=use_fp16)
 
 
@@ -2258,14 +2264,14 @@ def _render_chat_view() -> None:
                 _chat_fail(active_sess, f"⚠️ Qdrant 連線失敗：\n```\n{e}\n```")
             if not cli.collection_exists(sb_qdrant_coll):
                 _chat_fail(active_sess, f"⚠️ Collection `{sb_qdrant_coll}` 不存在")
-            # Embedder：前景（主執行緒）載入，cache_resource 確保只載一次。首次 ~15-60s
-            # 同步阻塞於此（這是安全的 —— GPU 模型必須在主執行緒載入/推理，詳見
-            # load_embedder 註解）。若首次載入期間發生 websocket 斷線，屬部屬層 idle
-            # timeout 問題，請放寬 proxy 逾時或採獨立行程方案，勿改回背景執行緒。
+            # Embedder：主執行緒前景載入，cache_resource 只載一次。預設 CPU（device 預設
+            # cpu）—— 2050 的 4GB 顯存放不下 Streamlit 行程內的 bge-m3，GPU 路徑會 CUDA
+            # OOM 讓整個行程 abort。CPU 載入約 2-3s、單句 encode <1s，互動查詢足夠。
             try:
                 embedder = load_embedder(
                     st.session_state.get("embed_model", EMBEDDING_MODEL),
                     st.session_state.get("embed_fp16", True),
+                    st.session_state.get("embed_device", "cpu"),
                 )
             except Exception as e:
                 _chat_fail(active_sess, f"⚠️ Embedder 載入失敗：\n```\n{e}\n```")
@@ -2537,7 +2543,7 @@ with st.sidebar:
             key="_fastpipe_embed_btn",
         ):
             try:
-                _embedder = load_embedder(_fp_model, _fp_fp16)
+                _embedder = load_embedder(_fp_model, _fp_fp16, st.session_state.get("embed_device", "cpu"))
             except Exception as e:
                 st.session_state["_fastpipe_report"] = f"⚡ 一鍵 embedding 失敗：模型載入錯誤 {e}"
                 st.rerun()
@@ -3178,7 +3184,7 @@ with tab_embed:
     )
 
     # === 設定列 ===
-    cfg_cols = st.columns([2, 2, 1, 2])
+    cfg_cols = st.columns([2, 2, 1, 1, 2])
     with cfg_cols[0]:
         model_name = st.selectbox(
             "模型", AVAILABLE_EMBEDDERS, index=0, key="embed_model",
@@ -3191,9 +3197,15 @@ with tab_embed:
     with cfg_cols[2]:
         use_fp16 = st.toggle(
             "FP16", value=True, key="embed_fp16",
-            help="省 VRAM 與磁碟（dense 存 float16）",
+            help="省 VRAM 與磁碟（dense 存 float16）。device=cpu 時自動忽略",
         )
     with cfg_cols[3]:
+        st.selectbox(
+            "裝置", ["cpu", "cuda"], index=0, key="embed_device",
+            help="cpu：小顯存卡（如 2050 4GB）唯一安全選擇，bge-m3 載入~2-3s、單句 encode <1s。"
+                 "cuda：需 ≳6GB 空閒顯存，4GB 卡會 OOM 讓行程直接崩潰。",
+        )
+    with cfg_cols[4]:
         st.caption(
             f"`pipeline={PIPELINE_VERSION}` · "
             f"`embed_ver={EMBEDDING_VERSION}` · "
@@ -3284,7 +3296,7 @@ with tab_embed:
             key="btn_full_encode",
         ):
             try:
-                embedder = load_embedder(model_name, use_fp16)
+                embedder = load_embedder(model_name, use_fp16, st.session_state.get("embed_device", "cpu"))
             except Exception as e:
                 st.error(f"模型載入失敗：\n```\n{e}\n```")
                 embedder = None
@@ -3364,7 +3376,7 @@ with tab_embed:
             use_container_width=True,
         ):
             try:
-                embedder = load_embedder(model_name, use_fp16)
+                embedder = load_embedder(model_name, use_fp16, st.session_state.get("embed_device", "cpu"))
             except Exception as e:
                 st.error(f"模型載入失敗：\n```\n{e}\n```")
                 embedder = None
@@ -3737,6 +3749,7 @@ with tab_search:
             s_embedder = load_embedder(
                 st.session_state.get("embed_model", EMBEDDING_MODEL),
                 st.session_state.get("embed_fp16", True),
+                st.session_state.get("embed_device", "cpu"),
             )
         except Exception as e:
             st.error(f"模型載入失敗：\n```\n{e}\n```")
