@@ -48,7 +48,9 @@
       "Bash(git commit *)",
       "Bash(git *)",
       "Bash(python *)",
-      "Bash(/c/project_file/RAG_PuTrue/venv312/Scripts/python.exe *)"
+      "Bash(/c/project_file/RAG_PuTrue/venv312/Scripts/python.exe *)",
+      "WebSearch",
+      "WebFetch(domain:dify.ai)"
     ]
   }
 }

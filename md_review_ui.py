@@ -1206,6 +1206,36 @@ def get_qdrant_client(url: str, api_key: str):
     )
 
 
+@st.cache_resource(show_spinner=False)
+def get_ollama_client(host: str):
+    """Cached Ollama client（host 改變自動建新 entry）。
+
+    底層斷線防護：ollama 預設 `timeout=None`（httpx 永不逾時），遠端 ollama
+    （跨機）卡住／重載模型時，會把整個 Streamlit rerun 永久阻塞、websocket idle
+    被部屬層剪斷。這裡給有界逾時 —— 串流模式下 read timeout 是「相鄰兩個 token
+    之間」的上限，不是整段生成上限，所以 300s 對慢的首 token 也夠寬。
+    """
+    import httpx
+    return OllamaClient(
+        host=host,
+        timeout=httpx.Timeout(300.0, connect=10.0),
+    )
+
+
+def _ollama_stream_tokens(stream):
+    """把 ollama stream 的各 part 拆出純文字 token，餵給 st.write_stream。
+
+    串流是底層斷線的治本解：生成期間 websocket 持續有資料流動，連線不會被
+    判定為 idle 而遭部屬層（proxy / 瀏覽器）剪斷，UI 也即時更新不再全凍。
+    與既有程式一致用 subscript 取值（此 ollama 版本支援）。
+    """
+    for part in stream:
+        tok = (part.get("message") or {}).get("content", "") if isinstance(part, dict) \
+            else (getattr(getattr(part, "message", None), "content", "") or "")
+        if tok:
+            yield tok
+
+
 PAYLOAD_INDEX_FIELDS = [
     # (field path, schema type) — 對齊 qdrant格式.md §2.2
     ("metadata.source.project_name", "keyword"),
@@ -2113,6 +2143,11 @@ def _render_chat_view() -> None:
                                 btn_key_prefix=f"_src_{active_sid}_{msg_idx}",
                             )
 
+            # 本輪 in-flight 對話的串流容器：放在歷史下方、輸入框上方。
+        # 送出處理區（在 col 之外）會 `with live_turn:` 把 user 泡泡 + 串流 assistant
+        # 泡泡寫進這裡，確保串流內容渲染在正確的對話欄位、且 websocket 持續有流量。
+        live_turn = st.container()
+
         user_q = st.chat_input("輸入問題（Enter 送出）...")
 
     with col_imgs:
@@ -2162,8 +2197,13 @@ def _render_chat_view() -> None:
     if user_q and user_q.strip():
         q = user_q.strip()
 
-        # 先把 user msg 加入 history（render 在下一次 rerun）
+        # 先把 user msg 加入 history
         active_sess["messages"].append({"role": "user", "content": q})
+
+        # 立即在 in-flight 容器渲染 user 泡泡（不必等整輪生成完才看到自己的提問）
+        with live_turn:
+            with st.chat_message("user"):
+                st.markdown(q)
 
         # 1. RAG（可選）
         rag_chunks: list[dict] = []
@@ -2184,7 +2224,7 @@ def _render_chat_view() -> None:
             except Exception as e:
                 _chat_fail(active_sess, f"⚠️ Embedder 載入失敗：\n```\n{e}\n```")
 
-            ollama_cli = OllamaClient(host=sb_ollama_url)
+            ollama_cli = get_ollama_client(sb_ollama_url)
 
             # 2. HyDE 改寫（可選）
             embed_query_text = q
@@ -2210,7 +2250,7 @@ def _render_chat_view() -> None:
                 _chat_fail(active_sess, f"⚠️ 檢索失敗：\n```\n{e}\n```")
             rag_chunks = [{"score": h.score, "payload": h.payload or {}} for h in hits]
         else:
-            ollama_cli = OllamaClient(host=sb_ollama_url)
+            ollama_cli = get_ollama_client(sb_ollama_url)
 
         # 4. 組 messages
         sys_prompt = LLM_RAG_SYSTEM_PROMPT if sb_rag_on else LLM_DEFAULT_SYSTEM_PROMPT
@@ -2231,20 +2271,23 @@ def _render_chat_view() -> None:
         else:
             messages.append({"role": "user", "content": q})
 
-        # 5. LLM 呼叫
+        # 5. LLM 呼叫（串流）—— 底層斷線治本：生成期間 token 持續流過 websocket，
+        # 連線不會 idle、UI 即時逐字更新。answer = 串流全文（st.write_stream 回傳）。
         try:
-            with st.spinner("LLM 生成中..."):
-                resp = ollama_cli.chat(
-                    model=active_model,
-                    messages=messages,
-                    options={
-                        "num_ctx": int(sb_num_ctx),
-                        "temperature": float(sb_temp),
-                        "top_p": float(sb_top_p),
-                        "num_predict": int(sb_num_predict),
-                    },
-                )
-            answer = resp["message"]["content"]
+            with live_turn:
+                with st.chat_message("assistant"):
+                    stream = ollama_cli.chat(
+                        model=active_model,
+                        messages=messages,
+                        options={
+                            "num_ctx": int(sb_num_ctx),
+                            "temperature": float(sb_temp),
+                            "top_p": float(sb_top_p),
+                            "num_predict": int(sb_num_predict),
+                        },
+                        stream=True,
+                    )
+                    answer = st.write_stream(_ollama_stream_tokens(stream))
         except Exception as e:
             _chat_fail(active_sess, f"⚠️ LLM 呼叫失敗：`{e}`", chunks=rag_chunks)
 
