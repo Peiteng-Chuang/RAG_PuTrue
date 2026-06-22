@@ -19,6 +19,7 @@ import platform
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -167,11 +168,36 @@ def find_soffice(override: str | None = None) -> str | None:
     return found
 
 
-def _lo_profile_uri() -> str:
-    """獨立使用者設定，避免與正在運行的 LO GUI 實例衝突。"""
-    profile = (PDF_CACHE_DIR / "_lo_profile").absolute()
-    profile.mkdir(parents=True, exist_ok=True)
-    return "file:///" + str(profile).replace("\\", "/")
+def _lo_profiles_root() -> Path:
+    """所有「每次轉檔用完即丟」的臨時 profile 的母目錄。"""
+    root = (PDF_CACHE_DIR / "_lo_profiles").absolute()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _run_soffice_convert(soffice_path: str, source_path: Path, profile_dir: Path):
+    """用一個指定的、獨立的 user profile 跑一次 headless 轉檔。回 CompletedProcess。
+
+    profile 獨立（每次呼叫換新）是可靠性關鍵：LibreOffice headless 在 Windows 上
+    常因『共用 profile 殘留鎖檔 / 髒狀態』或『多實例並發共用同一 profile』而以 heap
+    corruption（exit=0xC0000374 / 3221226356）崩潰。不同 UserInstallation 會被當成
+    不同實例 → 可並發、且永不被前一次的殘留鎖檔毒化。另加數個硬化旗標。
+    """
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    profile_uri = "file:///" + str(profile_dir.absolute()).replace("\\", "/")
+    cmd = [
+        soffice_path,
+        f"-env:UserInstallation={profile_uri}",
+        "--headless", "--norestore", "--nolockcheck",
+        "--nologo", "--nofirststartwizard",
+        "--convert-to", "pdf",
+        "--outdir", str(PDF_CACHE_DIR),
+        str(source_path),
+    ]
+    return subprocess.run(
+        cmd, capture_output=True, text=True, timeout=180,
+        encoding="utf-8", errors="replace",
+    )
 
 
 def ensure_pdf(source_path: Path, soffice_path: str | None = None) -> Path:
@@ -191,29 +217,41 @@ def ensure_pdf(source_path: Path, soffice_path: str | None = None) -> Path:
             "或在左側 sidebar『LibreOffice 路徑』手動指定 soffice.exe。"
         )
 
-    cmd = [
-        soffice_path,
-        f"-env:UserInstallation={_lo_profile_uri()}",
-        "--headless", "--convert-to", "pdf",
-        "--outdir", str(PDF_CACHE_DIR),
-        str(source_path),
-    ]
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=180,
-            encoding="utf-8", errors="replace",
-        )
-    except FileNotFoundError:
-        raise RuntimeError(f"LibreOffice 路徑無效：{soffice_path}")
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("LibreOffice 轉檔逾時 (>180s)，可能有 LO 實例卡住。")
+    # 每次轉檔給一個全新、獨立的臨時 profile；失敗（含 heap-corruption 崩潰）就換另一個
+    # 全新 profile 再試一次。每次用完即刪，不留鎖檔毒化後續轉檔。
+    last_err = ""
+    result = None
+    for _attempt in range(2):
+        profile_dir = Path(tempfile.mkdtemp(prefix="lo_", dir=str(_lo_profiles_root())))
+        try:
+            result = _run_soffice_convert(soffice_path, source_path, profile_dir)
+        except FileNotFoundError:
+            raise RuntimeError(f"LibreOffice 路徑無效：{soffice_path}")
+        except subprocess.TimeoutExpired:
+            last_err = "LibreOffice 轉檔逾時 (>180s)，可能有 LO 實例卡住。"
+            result = None
+            continue
+        finally:
+            shutil.rmtree(profile_dir, ignore_errors=True)
 
-    if result.returncode != 0:
-        raise RuntimeError(
+        if result.returncode == 0:
+            break
+        last_err = (
             f"LibreOffice 轉檔失敗 (exit={result.returncode})\n"
             f"stderr: {(result.stderr or '').strip()[:500]}\n"
             f"stdout: {(result.stdout or '').strip()[:200]}"
         )
+
+    if result is None or result.returncode != 0:
+        hint = ""
+        if result is not None and (result.returncode & 0xFFFFFFFF) == 0xC0000374:
+            hint = (
+                "\n\n提示：exit=0xC0000374 是 Windows heap corruption，soffice 程序崩潰。"
+                "常見原因：(1) 同機另有 LibreOffice 視窗/程序在跑 → 請關閉；"
+                "(2) LibreOffice 版本過舊或安裝損毀 → 重裝最新版；"
+                "(3) 該 .pptx 本身含 LO 無法處理的內容。本程式已每次用獨立 profile + 自動重試一次。"
+            )
+        raise RuntimeError((last_err or "LibreOffice 轉檔失敗") + hint)
 
     if cached.exists() and cached.stat().st_size > 0:
         return cached
@@ -1159,9 +1197,8 @@ def clear_vector_cache(file_key: str) -> int:
     return n
 
 
-@st.cache_resource(show_spinner="載入 bge-m3 中（首次需 ~15s）...")
-def load_embedder(model_name: str, use_fp16: bool):
-    """快取整個 BGEM3FlagModel 物件，避免每次 rerun 重載。"""
+def _load_embedder_impl(model_name: str, use_fp16: bool):
+    """實際載入 BGEM3FlagModel（純函式、不碰 streamlit；供前景與背景執行緒共用）。"""
     try:
         from FlagEmbedding import BGEM3FlagModel
     except ImportError as e:
@@ -1171,6 +1208,67 @@ def load_embedder(model_name: str, use_fp16: bool):
             "（依賴 peft / accelerate，第一次裝約 100MB）"
         ) from e
     return BGEM3FlagModel(model_name, use_fp16=use_fp16)
+
+
+# === bge-m3 背景預載（底層斷線治本 #2）===
+# 問題：bge-m3 首次載入 ~15-60s 是一段「無法串流」的同步阻塞。若放在對話送出的
+# rerun 裡，那段 websocket 零流量 → 被部屬層 idle timeout 剪斷（= 使用者回報的
+# 「初始對話載入 bge-m3 時中斷」）。對策：開機就在背景執行緒把模型載好，請求路徑
+# 上只做「就緒檢查」，未就緒時靠輪詢 rerun（產生流量）等待，永不長阻塞主執行緒。
+# 背景執行緒**絕不呼叫任何 st.* API**（無 ScriptRunContext），只回傳模型物件。
+import threading
+
+_EMBEDDER_BG: dict = {"model": None, "loading": False, "error": "", "key": None}
+_EMBEDDER_BG_LOCK = threading.Lock()
+
+
+def start_embedder_warmup(model_name: str, use_fp16: bool) -> None:
+    """冪等地在背景執行緒預載 embedder。已載好／載入中／同 key 則 no-op。"""
+    key = (model_name, use_fp16)
+    with _EMBEDDER_BG_LOCK:
+        same = _EMBEDDER_BG["key"] == key
+        if same and (_EMBEDDER_BG["model"] is not None or _EMBEDDER_BG["loading"]):
+            return
+        _EMBEDDER_BG.update({"model": None, "loading": True, "error": "", "key": key})
+
+    def _run():
+        model, err = None, ""
+        try:
+            model = _load_embedder_impl(model_name, use_fp16)
+        except Exception as e:  # noqa: BLE001 — 背景載入失敗，狀態回報給前景
+            err = str(e)
+        with _EMBEDDER_BG_LOCK:
+            if _EMBEDDER_BG["key"] == key:
+                _EMBEDDER_BG.update({"model": model, "error": err, "loading": False})
+
+    threading.Thread(target=_run, daemon=True, name="bge-m3-warmup").start()
+
+
+def get_warm_embedder(model_name: str, use_fp16: bool):
+    """回背景已預載好的 embedder；尚未就緒回 None。"""
+    with _EMBEDDER_BG_LOCK:
+        if _EMBEDDER_BG["key"] == (model_name, use_fp16):
+            return _EMBEDDER_BG["model"]
+    return None
+
+
+def embedder_warm_error(model_name: str, use_fp16: bool) -> str:
+    with _EMBEDDER_BG_LOCK:
+        if _EMBEDDER_BG["key"] == (model_name, use_fp16):
+            return _EMBEDDER_BG["error"]
+    return ""
+
+
+@st.cache_resource(show_spinner="載入 bge-m3 中（首次需 ~15s）...")
+def load_embedder(model_name: str, use_fp16: bool):
+    """快取整個 BGEM3FlagModel 物件，避免每次 rerun 重載。
+
+    若背景預載（start_embedder_warmup）已備妥同款模型，直接沿用、零等待；
+    否則前景載入（批次 Tab 等非對話路徑的 fallback）。"""
+    warm = get_warm_embedder(model_name, use_fp16)
+    if warm is not None:
+        return warm
+    return _load_embedder_impl(model_name, use_fp16)
 
 
 def encode_chunks(
@@ -1638,6 +1736,13 @@ if "chat_sessions" not in st.session_state:
     st.session_state.active_chat_session = _loaded_active
 if "active_chat_session" not in st.session_state:
     st.session_state.active_chat_session = None
+
+# 開機即在背景預載 bge-m3：讓首次對話前模型多半已就緒，把那段無法串流的長阻塞
+# 移出請求路徑（見 start_embedder_warmup 註解）。daemon 執行緒、非阻塞、冪等。
+start_embedder_warmup(
+    st.session_state.get("embed_model", EMBEDDING_MODEL),
+    st.session_state.get("embed_fp16", True),
+)
 
 
 def _chat_fail(active_sess: dict, text: str, chunks: list | None = None) -> None:
@@ -2193,6 +2298,25 @@ def _render_chat_view() -> None:
                     st.session_state["_chat_dialog_metas"] = all_metas
                     _chat_image_gallery_dialog()
 
+    # ---- 背景模型就緒前的輪詢等待 ----
+    # 提問因 bge-m3 仍在背景載入而被暫存時，每次 rerun 在這裡檢查就緒狀態：
+    # 未就緒就顯示進度 + 短 sleep + rerun（這個 rerun 本身就是 websocket 流量，
+    # 讓連線在 15–60s 載入期不致 idle 斷線）；就緒則取回暫存提問當本輪 user_q 續送。
+    if not (user_q and user_q.strip()) and st.session_state.get("_pending_chat_q"):
+        _pem = st.session_state.get("embed_model", EMBEDDING_MODEL)
+        _pfp = st.session_state.get("embed_fp16", True)
+        _perr = embedder_warm_error(_pem, _pfp)
+        if _perr:
+            st.session_state.pop("_pending_chat_q", None)
+            _chat_fail(active_sess, f"⚠️ Embedder 載入失敗：\n```\n{_perr}\n```")
+        elif get_warm_embedder(_pem, _pfp) is None:
+            with live_turn:
+                st.info("🔧 首次啟動：背景載入 bge-m3 向量模型中（約 15–60s），就緒後會自動送出您的問題…")
+            time.sleep(1.5)
+            st.rerun()
+        else:
+            user_q = st.session_state.pop("_pending_chat_q")
+
     # ---- 送出處理 ----
     if user_q and user_q.strip():
         q = user_q.strip()
@@ -2216,13 +2340,21 @@ def _render_chat_view() -> None:
                 _chat_fail(active_sess, f"⚠️ Qdrant 連線失敗：\n```\n{e}\n```")
             if not cli.collection_exists(sb_qdrant_coll):
                 _chat_fail(active_sess, f"⚠️ Collection `{sb_qdrant_coll}` 不存在")
-            try:
-                embedder = load_embedder(
-                    st.session_state.get("embed_model", EMBEDDING_MODEL),
-                    st.session_state.get("embed_fp16", True),
-                )
-            except Exception as e:
-                _chat_fail(active_sess, f"⚠️ Embedder 載入失敗：\n```\n{e}\n```")
+            # Embedder 就緒檢查（非阻塞）：背景已預載好→直接用；還在載→撤回本輪提問、
+            # 暫存後輪詢等待，不在請求路徑上做那段「無法串流」的長阻塞（避免 websocket
+            # idle 被部屬層剪斷 = 使用者回報的「初始對話載入 bge-m3 時中斷」）。
+            _em = st.session_state.get("embed_model", EMBEDDING_MODEL)
+            _fp = st.session_state.get("embed_fp16", True)
+            start_embedder_warmup(_em, _fp)
+            embedder = get_warm_embedder(_em, _fp)
+            if embedder is None:
+                _werr = embedder_warm_error(_em, _fp)
+                if _werr:
+                    _chat_fail(active_sess, f"⚠️ Embedder 載入失敗：\n```\n{_werr}\n```")
+                if active_sess["messages"] and active_sess["messages"][-1].get("role") == "user":
+                    active_sess["messages"].pop()
+                st.session_state["_pending_chat_q"] = q
+                st.rerun()
 
             ollama_cli = get_ollama_client(sb_ollama_url)
 
