@@ -2187,25 +2187,7 @@ def _render_chat_view() -> None:
                 key="_chat_rag_on",
                 help="關掉 = 純 LLM 對話（不檢索）",
             )
-
-            # 指定專案搜尋（預設留空＝跨專案全搜；勾選後才像審閱模式 Tab 6 那樣加 project filter）。
-            # 建案清單從 collection facet 反查（連線設定的 widget key 已 persist 於 session_state）。
-            sb_projects: list[str] = []
-            if sb_rag_on:
-                _proj_opts = list_projects_in_collection(
-                    st.session_state.get("_chat_qdrant_url", QDRANT_DEFAULT_URL),
-                    st.session_state.get("_chat_qdrant_key", ""),
-                    st.session_state.get("_chat_qdrant_coll", QDRANT_TEXT_COLLECTION),
-                )
-                sb_projects = st.multiselect(
-                    "🏗 指定專案（留空＝跨專案全搜）",
-                    options=_proj_opts,
-                    default=[],
-                    key="_chat_filter_projects",
-                    help="留空時搜整個 collection；勾選後只在這些建案內檢索（多選用 OR，比照 Tab 6）。",
-                )
-                if not _proj_opts:
-                    st.caption("（未取得建案清單：Qdrant 未連線或 collection 為空 → 將跨專案搜尋）")
+            # 「指定專案」多選框不放這裡，改置於聊天室正上方的 sticky bar（見主區）
 
         # LLM 參數
         with st.expander("⚙️ LLM 參數", expanded=False):
@@ -2264,6 +2246,45 @@ def _render_chat_view() -> None:
     if active_sess is None:
         st.warning("尚無 active session。請點左側「➕ 新對話」")
         return
+
+    # === 聊天室正上方「指定專案」sticky bar ===
+    # 釘在 Streamlit header 下方（position:sticky），捲動對話歷史時固定不被泡泡蓋住。
+    # 留空＝跨專案全搜；勾選後才加 project filter（比照審閱模式 Tab 6）。
+    st.markdown(
+        """
+        <style>
+        .st-key-chat_project_bar {
+            position: sticky;
+            top: 3.75rem;            /* ≈ Streamlit 固定 header 高度，貼其下方不被蓋住 */
+            z-index: 100;
+            background: var(--background-color, #ffffff);
+            padding: 0.45rem 0.2rem;
+            margin-bottom: 0.3rem;
+            border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    sb_projects: list[str] = []
+    with st.container(key="chat_project_bar"):
+        if sb_rag_on:
+            _proj_opts = list_projects_in_collection(
+                st.session_state.get("_chat_qdrant_url", QDRANT_DEFAULT_URL),
+                st.session_state.get("_chat_qdrant_key", ""),
+                st.session_state.get("_chat_qdrant_coll", QDRANT_TEXT_COLLECTION),
+            )
+            sb_projects = st.multiselect(
+                "🏗 指定專案（留空＝跨專案全搜）",
+                options=_proj_opts,
+                default=[],
+                key="_chat_filter_projects",
+                help="留空時搜整個 collection；勾選後只在這些建案內檢索（多選用 OR，比照 Tab 6）。",
+            )
+            if not _proj_opts:
+                st.caption("（未取得建案清單：Qdrant 未連線或 collection 為空 → 將跨專案搜尋）")
+        else:
+            st.caption("🔗 RAG 已關閉（純 LLM 對話）—— 開啟後可在此指定專案")
 
     col_chat, col_imgs = st.columns([2, 1], gap="large")
 
