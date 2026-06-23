@@ -76,12 +76,20 @@ except ImportError:
     llm_generate_title = None
     HAS_OLLAMA = False
 
+# 對話紀錄「瀏覽器 localStorage」持久化（退化版：不再寫 server 磁碟，多人共用 server 時各自獨立）
+try:
+    from streamlit_local_storage import LocalStorage
+    HAS_LOCALSTORAGE = True
+except Exception:  # noqa: BLE001 — 缺元件時退回純記憶體（session_state），不擋啟動
+    LocalStorage = None
+    HAS_LOCALSTORAGE = False
+
 
 # === 路徑設定 ===
 DEFAULT_DATA_PATH = r"D:/璞真RAG資料夾/12.個案銷講資料"
 MKDATA_PATH = Path("./mkdata")
 TRACKER = MKDATA_PATH / "process_tracker.json"
-CHAT_STORE = MKDATA_PATH / "chat_sessions.json"  # 對話模式聊天紀錄持久化（F5 不遺失）
+CHAT_LS_KEY = "putrue_chat_sessions"  # 對話紀錄存放於瀏覽器 localStorage 的 item key（取代舊的 server 磁碟檔）
 REVIEW_PASSWORD = "123456"  # 進入審閱模式（ETL 標記工具）的密碼鎖
 PDF_CACHE_DIR = Path("./_compare_cache")
 TRASH_DIR = Path("./_md_trash")
@@ -1634,36 +1642,81 @@ if "sidecars" not in st.session_state:
     st.session_state.sidecars = {}
 
 # === View state（審閱模式 ↔ 對話模式）+ chat sessions 容器 ===
-def _save_chat_sessions() -> None:
-    """把 chat_sessions + active id 原子寫入 CHAT_STORE。
+def _get_local_storage():
+    """取得 LocalStorage 元件實例（無元件回 None）。
 
-    寫 tmp 再 os.replace，避免半寫壞檔（崩潰／F5 中途）覆蓋掉好檔。messages 內的
-    chunks 是 {"score": float, "payload": dict}，皆 JSON 可序列化。寫檔失敗只警告、
-    不中斷對話（持久化是加分功能，不該擋住主流程）。
+    元件 __init__ 首跑會對瀏覽器做一次 getAll round-trip 並快取進 st.session_state，
+    之後同一 session 重建走快取分支、不再連線瀏覽器 → 每個 rerun 呼叫都很便宜。
     """
-    try:
-        MKDATA_PATH.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "version": 1,
-            "active": st.session_state.get("active_chat_session"),
-            "sessions": st.session_state.get("chat_sessions", {}),
+    if not HAS_LOCALSTORAGE:
+        return None
+    return LocalStorage(key="_ls_chat")
+
+
+def _slim_sessions_for_storage(sessions: dict) -> dict:
+    """序列化到 localStorage 前剝掉每則 chunk 的 payload.content（正文，體積最大）。
+
+    送出 LLM 後，chunks 只剩「來源清單」與「右欄圖片」會用到，兩者都只讀 metadata
+    （source / location / visuals），用不到正文。剝除可大幅降低 localStorage 體積，
+    避開瀏覽器 ~5MB 配額上限。assistant 回答本身存在 message.content，不受影響。
+    """
+    slim: dict = {}
+    for sid, sess in (sessions or {}).items():
+        msgs = []
+        for m in sess.get("messages", []):
+            mm = {"role": m.get("role"), "content": m.get("content", "")}
+            chs = m.get("chunks")
+            if chs:
+                mm["chunks"] = [
+                    {
+                        "score": c.get("score"),
+                        "payload": {"metadata": (c.get("payload", {}) or {}).get("metadata", {})},
+                    }
+                    for c in chs
+                ]
+            msgs.append(mm)
+        slim[sid] = {
+            "title": sess.get("title", "新對話"),
+            "messages": msgs,
+            "last_chunks": [],
+            "created": sess.get("created"),
         }
-        tmp = CHAT_STORE.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        os.replace(tmp, CHAT_STORE)
+    return slim
+
+
+def _save_chat_sessions() -> None:
+    """把 chat_sessions + active id 存進『瀏覽器 localStorage』。
+
+    退化版：不再寫 server 磁碟（舊版單一 chat_sessions.json 會被同 server 全團隊共用、
+    互看互蓋）。改存瀏覽器後每人各自獨立。無 localStorage 元件時退回純記憶體（本 session
+    有效、F5 即失），不中斷對話。
+    """
+    if not HAS_LOCALSTORAGE:
+        return
+    try:
+        ls = _get_local_storage()
+        payload = {
+            "version": 2,
+            "active": st.session_state.get("active_chat_session"),
+            "sessions": _slim_sessions_for_storage(st.session_state.get("chat_sessions", {})),
+        }
+        ls.setItem(CHAT_LS_KEY, json.dumps(payload, ensure_ascii=False), key="_ls_set_chat")
+        # 一旦自己存過，記憶體即為真相來源 → 別再讓啟動對帳用瀏覽器舊值覆蓋
+        st.session_state["_ls_chat_loaded"] = True
     except Exception as e:  # noqa: BLE001 — 持久化失敗不可中斷對話
-        st.warning(f"聊天紀錄存檔失敗（本輪仍在記憶體中）：{e}")
+        st.warning(f"聊天紀錄存入瀏覽器失敗（本輪仍在記憶體中）：{e}")
 
 
 def _load_chat_sessions() -> tuple[dict, str | None]:
-    """從 CHAT_STORE 載回 (sessions, active_id)；檔不存在或壞檔回 ({}, None)。"""
-    if not CHAT_STORE.exists():
+    """從瀏覽器 localStorage 載回 (sessions, active_id)；無資料或壞檔回 ({}, None)。"""
+    if not HAS_LOCALSTORAGE:
         return {}, None
     try:
-        data = json.loads(CHAT_STORE.read_text(encoding="utf-8"))
+        ls = _get_local_storage()
+        raw = ls.getItem(CHAT_LS_KEY)
+        if not raw:
+            return {}, None
+        data = json.loads(raw) if isinstance(raw, str) else raw
         sessions = data.get("sessions", {}) or {}
         active = data.get("active")
         if not isinstance(sessions, dict):
@@ -1671,21 +1724,30 @@ def _load_chat_sessions() -> tuple[dict, str | None]:
         if active not in sessions:
             active = None
         return sessions, active
-    except Exception as e:  # noqa: BLE001 — 壞檔不可中斷啟動
-        st.warning(f"聊天紀錄讀取失敗，將以空白開始：{e}")
+    except Exception as e:  # noqa: BLE001 — 壞資料不可中斷啟動
+        st.warning(f"瀏覽器聊天紀錄讀取失敗，將以空白開始：{e}")
         return {}, None
 
 
 if "app_view" not in st.session_state:
     st.session_state.app_view = "chat"  # 預設進對話模式（審閱模式需密碼解鎖）
+
+# chat_sessions[session_id] = {"title": str, "messages": [{"role","content"}], "last_chunks": [], "created": iso}
+# 從瀏覽器 localStorage 對帳載回。元件首跑回 default（空）、真資料於下一個 rerun 才到，
+# 因此用 _ls_chat_loaded flag 對帳：在真資料抵達（或自己存過）前不鎖定，避免把「首跑的空」
+# 當成最終值而永遠載不到舊紀錄。
 if "chat_sessions" not in st.session_state:
-    # chat_sessions[session_id] = {"title": str, "messages": [{"role","content"}], "last_chunks": [], "created": iso}
-    # 從磁碟載回（F5／重啟不遺失）
-    _loaded_sessions, _loaded_active = _load_chat_sessions()
-    st.session_state.chat_sessions = _loaded_sessions
-    st.session_state.active_chat_session = _loaded_active
+    st.session_state.chat_sessions = {}
 if "active_chat_session" not in st.session_state:
     st.session_state.active_chat_session = None
+if HAS_LOCALSTORAGE and not st.session_state.get("_ls_chat_loaded"):
+    _loaded_sessions, _loaded_active = _load_chat_sessions()
+    if _loaded_sessions:  # 瀏覽器真資料已抵達 → 還原並鎖定
+        st.session_state.chat_sessions = _loaded_sessions
+        st.session_state.active_chat_session = _loaded_active
+        st.session_state["_ls_chat_loaded"] = True
+    # 否則（首跑 default 或瀏覽器本就空）：不鎖定，下個 rerun 再試；一旦使用者開始對話
+    # 觸發 _save_chat_sessions 即把 flag 設 True、改以記憶體為真相來源。
 
 
 def _chat_fail(active_sess: dict, text: str, chunks: list | None = None) -> None:
@@ -3678,7 +3740,7 @@ with tab_search:
     st.subheader("檢索測試（dense / sparse / hybrid 三欄並排）")
     st.caption(
         "對已寫入 Qdrant 的向量做語意檢索。比較三種模式對術語 / 案場名 / 工法名的回收差異。"
-        "點「📂 跳回該檔該頁」會切到 Tab 1 對應檔案頁面肉眼驗證 citation。"
+        "點「📂 內嵌顯示此頁」會在結果方塊內直接渲染該引用頁，肉眼驗證 citation 不必離開本 Tab。"
     )
 
     if not HAS_QDRANT:
@@ -3843,17 +3905,24 @@ with tab_search:
                             f"</div>",
                             unsafe_allow_html=True,
                         )
-                        jump_key = f"jump_{key}_{rank}_{h.id}"
-                        if (
-                            file_key_hit
-                            and file_key_hit in file_keys
-                            and page_hit
-                            and st.button(
-                                "📂 跳回該檔該頁",
-                                key=jump_key,
+                        # 內嵌頁面預覽（取代舊「跳回 Tab 1」）：比照對話模式 _render_source_page_inline，
+                        # 伺服器把該引用頁渲染成 PNG 原地展開／收合，肉眼驗證 citation 不必離開本 Tab。
+                        if file_key_hit and page_hit and file_key_hit in file_keys:
+                            prev_token = f"{key}_{rank}_{h.id}"
+                            is_open = st.session_state.get("_search_preview_token") == prev_token
+                            if st.button(
+                                "📂 收合此頁" if is_open else "📂 內嵌顯示此頁",
+                                key=f"srch_prev_{prev_token}",
                                 use_container_width=True,
-                            )
-                        ):
-                            st.session_state["sidebar_file_selectbox"] = file_key_hit
-                            st.session_state["_pending_page_idx"] = max(0, int(page_hit) - 1)
-                            st.rerun()
+                            ):
+                                st.session_state["_search_preview_token"] = (
+                                    None if is_open else prev_token
+                                )
+                                st.rerun()
+                            if st.session_state.get("_search_preview_token") == prev_token:
+                                _render_source_page_inline(
+                                    data_path / file_key_hit, int(page_hit),
+                                    key_suffix=f"srch_{prev_token}",
+                                )
+                        elif file_key_hit and file_key_hit not in file_keys:
+                            st.caption(f"⚠ 本機未載入此檔，無法預覽：`{Path(file_key_hit).name}`")
