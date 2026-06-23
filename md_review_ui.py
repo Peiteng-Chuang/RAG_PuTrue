@@ -97,13 +97,17 @@ PDF_CACHE_DIR.mkdir(exist_ok=True)
 TRASH_DIR.mkdir(exist_ok=True)
 
 
-# === 系統常數（對齊 qdrant格式.md v2.0.0） ===
-PIPELINE_VERSION = "2.0.0"
+# === 系統常數（對齊 qdrant格式.md v2.1.0） ===
+PIPELINE_VERSION = "2.1.0"   # 2.1.0：新增 metadata.source.doc_type（文件種類）欄位 + 索引
 EMBEDDING_MODEL = "BAAI/bge-m3"
 EMBEDDING_VERSION = "v1"
 EMBEDDING_DIM_DENSE = 1024
 SIDECAR_VERSION = "1.0"
 CHUNKING_STRATEGY = "heading+token-v2"
+# 文件種類（doc_type）：以「資料夾 → doc_type」對照表為主、sidecar 逐檔覆寫為輔，皆無則用預設。
+# 對照表只是一檔小 JSON（一個資料夾一筆），避免逐檔 bulk 寫 sidecar。
+DOC_TYPE_MAP_PATH = MKDATA_PATH / "doc_type_map.json"
+DOC_TYPE_DEFAULT = "未分類"
 REVIEW_STATUSES = ["unprocessed", "processing", "encoded", "ingested"]
 STATUS_BADGE = {
     "unprocessed": {"emoji": "🔴", "label": "未處理",   "bg": "#fdecec", "fg": "#c0392b"},
@@ -370,6 +374,39 @@ def save_sidecar(file_key: str, sidecar: dict) -> None:
         encoding="utf-8",
     )
     tmp.replace(path)
+
+
+def load_doc_type_map() -> dict:
+    """讀「資料夾 → doc_type」對照表；無檔或壞檔回空 dict。"""
+    if not DOC_TYPE_MAP_PATH.exists():
+        return {}
+    try:
+        data = json.loads(DOC_TYPE_MAP_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_doc_type_map(mapping: dict) -> None:
+    """原子寫入「資料夾 → doc_type」對照表（tmp + rename）。"""
+    DOC_TYPE_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = DOC_TYPE_MAP_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(DOC_TYPE_MAP_PATH)
+
+
+def resolve_doc_type(file_key: str, sidecar: dict, doc_type_map: dict | None = None) -> str:
+    """決定某檔的文件種類，優先序：sidecar 逐檔覆寫 > 資料夾對照表 > 預設「未分類」。
+
+    傳入 doc_type_map 可避免在批次 chunk 迴圈裡反覆讀檔；未傳則自行載入。
+    """
+    override = (sidecar or {}).get("doc_type")
+    if override:
+        return str(override)
+    parts = split_key_parts(file_key)
+    folder = parts[0] if len(parts) > 1 else ""
+    dtm = doc_type_map if doc_type_map is not None else load_doc_type_map()
+    return str(dtm.get(folder) or DOC_TYPE_DEFAULT)
 
 
 def now_iso() -> str:
@@ -900,11 +937,15 @@ def build_chunk_payload(
     image_root: Path,
     prev_chunk_id: str | None,
     next_chunk_id: str | None,
+    doc_type: str | None = None,
 ) -> dict:
-    """產出 qdrant格式.md v2.0.0 完整 payload（含 point id）。
-    single source of truth：UI 預覽、JSON 下載、Qdrant upsert 全部用同一個輸出。"""
+    """產出 qdrant格式.md v2.1.0 完整 payload（含 point id）。
+    single source of truth：UI 預覽、JSON 下載、Qdrant upsert 全部用同一個輸出。
+
+    doc_type 由呼叫端（每份文件）算好一次傳入，避免在 chunk 迴圈反覆讀對照表；未傳則自行解析。"""
     parts = split_key_parts(file_key)
     project_name = parts[0] if len(parts) > 1 else "未分類"
+    doc_type = doc_type if doc_type is not None else resolve_doc_type(file_key, sidecar)
     file_name = parts[-1]
     file_stem = Path(file_name).stem
     file_hash = sidecar.get("file_hash", "")
@@ -934,6 +975,7 @@ def build_chunk_payload(
             "metadata": {
                 "source": {
                     "project_name": project_name,
+                    "doc_type": doc_type,
                     "file_key": file_key,
                     "file_name": file_name,
                     "file_path": file_key,
@@ -1005,6 +1047,7 @@ def build_all_chunks_for_doc(
     每筆額外帶 _page_pos（page index in pages list）供 UI 篩選用，
     寫入 Qdrant 前需 pop 掉這個底線開頭欄位。"""
     file_hash = sidecar.get("file_hash", "")
+    doc_type = resolve_doc_type(file_key, sidecar)  # 每份文件算一次，傳給每個 chunk
 
     flat: list[dict] = []
     for page_pos, (page_num, page_md_default) in enumerate(pages):
@@ -1052,6 +1095,7 @@ def build_all_chunks_for_doc(
             image_root=image_root,
             prev_chunk_id=prev_id,
             next_chunk_id=next_id,
+            doc_type=doc_type,
         )
         pkg["_page_pos"] = it["page_pos"]
         out.append(pkg)
@@ -1321,6 +1365,7 @@ def _ollama_stream_tokens(stream):
 PAYLOAD_INDEX_FIELDS = [
     # (field path, schema type) — 對齊 qdrant格式.md §2.2
     ("metadata.source.project_name", "keyword"),
+    ("metadata.source.doc_type",     "keyword"),
     ("metadata.source.file_hash",    "keyword"),
     ("metadata.source.file_key",     "keyword"),
     ("metadata.location.page",       "integer"),
@@ -1332,6 +1377,30 @@ PAYLOAD_INDEX_FIELDS = [
     ("sys_info.review_status",       "keyword"),
     ("sys_info.embedding_model",     "keyword"),
 ]
+
+
+def ensure_payload_indexes(client, name: str) -> list[str]:
+    """對既有 collection 補建所有 PAYLOAD_INDEX_FIELDS 索引（容錯、idempotent）。
+
+    create_payload_index 對「已存在的索引」會丟例外，這裡逐一吞掉 → 既有欄位不受影響，
+    新增欄位（如 doc_type）會在第一次呼叫時補建。回成功/已存在的 field 清單。"""
+    schema_map = {
+        "keyword": qm.PayloadSchemaType.KEYWORD,
+        "integer": qm.PayloadSchemaType.INTEGER,
+        "bool":    qm.PayloadSchemaType.BOOL,
+    }
+    done = []
+    for field, kind in PAYLOAD_INDEX_FIELDS:
+        try:
+            client.create_payload_index(
+                collection_name=name,
+                field_name=field,
+                field_schema=schema_map[kind],
+            )
+            done.append(field)
+        except Exception:
+            pass  # 多半是「索引已存在」，忽略
+    return done
 
 
 def ensure_text_collection(client, name: str, recreate: bool = False) -> dict:
@@ -1355,22 +1424,8 @@ def ensure_text_collection(client, name: str, recreate: bool = False) -> dict:
             },
         )
         info["created"] = True
-        # 建 payload indexes（容錯：個別失敗不擋整體流程）
-        schema_map = {
-            "keyword": qm.PayloadSchemaType.KEYWORD,
-            "integer": qm.PayloadSchemaType.INTEGER,
-            "bool":    qm.PayloadSchemaType.BOOL,
-        }
-        for field, kind in PAYLOAD_INDEX_FIELDS:
-            try:
-                client.create_payload_index(
-                    collection_name=name,
-                    field_name=field,
-                    field_schema=schema_map[kind],
-                )
-                info["indexed"].append(field)
-            except Exception:
-                pass
+    # 不論新建或既有，都確保索引齊全（既有 collection 也能補上新增的 doc_type 索引）
+    info["indexed"] = ensure_payload_indexes(client, name)
     return info
 
 
@@ -1406,28 +1461,33 @@ def get_collection_total(client, name: str) -> int:
 
 
 @st.cache_data(show_spinner=False, ttl=300)
-def list_projects_in_collection(url: str, api_key: str, coll: str) -> list[str]:
-    """列出某 collection 內所有 distinct 建案名（metadata.source.project_name）。
+def list_facet_values(url: str, api_key: str, coll: str, field: str) -> list[str]:
+    """用 Qdrant facet API 列出某 keyword 欄位的所有 distinct 值（給篩選下拉用）。
 
-    用 Qdrant facet API 取 distinct 值，給對話模式「指定專案」多選清單用（對話模式取不到
-    審閱模式的 file_keys，改從實際 ingest 進去的資料反查更準）。連線／查詢失敗回空 list，
-    讓 UI 退回跨專案全搜、不報錯。cache 5 分鐘，避免每次 rerun 都打 Qdrant。
+    連線／查詢失敗回空 list，讓 UI 退回「不篩」、不報錯。cache 5 分鐘避免每 rerun 打 Qdrant。
     """
     try:
         cli = get_qdrant_client(url, api_key)
         if not cli.collection_exists(coll):
             return []
-        resp = cli.facet(
-            collection_name=coll,
-            key="metadata.source.project_name",
-            limit=1000,
-        )
+        resp = cli.facet(collection_name=coll, key=field, limit=1000)
         return sorted(
             h.value for h in resp.hits
             if isinstance(getattr(h, "value", None), str) and h.value
         )
-    except Exception:  # noqa: BLE001 — 取不到清單不可擋住對話 UI
+    except Exception:  # noqa: BLE001 — 取不到清單不可擋住 UI
         return []
+
+
+def list_projects_in_collection(url: str, api_key: str, coll: str) -> list[str]:
+    """distinct 建案名（metadata.source.project_name）。對話模式取不到審閱模式的 file_keys，
+    改從實際 ingest 進去的資料反查更準。"""
+    return list_facet_values(url, api_key, coll, "metadata.source.project_name")
+
+
+def list_doc_types_in_collection(url: str, api_key: str, coll: str) -> list[str]:
+    """distinct 文件種類（metadata.source.doc_type）。"""
+    return list_facet_values(url, api_key, coll, "metadata.source.doc_type")
 
 
 def load_cached_vectors(file_key: str) -> tuple[np.ndarray, list[dict], dict]:
@@ -2318,24 +2378,33 @@ def _render_chat_view() -> None:
         unsafe_allow_html=True,
     )
     sb_projects: list[str] = []
+    sb_doc_types: list[str] = []
     with st.container(key="chat_project_bar"):
         if sb_rag_on:
-            _proj_opts = list_projects_in_collection(
-                st.session_state.get("_chat_qdrant_url", QDRANT_DEFAULT_URL),
-                st.session_state.get("_chat_qdrant_key", ""),
-                st.session_state.get("_chat_qdrant_coll", QDRANT_TEXT_COLLECTION),
-            )
-            sb_projects = st.multiselect(
-                "🏗 指定專案（留空＝跨專案全搜）",
-                options=_proj_opts,
-                default=[],
-                key="_chat_filter_projects",
-                help="留空時搜整個 collection；勾選後只在這些建案內檢索（多選用 OR，比照 Tab 6）。",
-            )
-            if not _proj_opts:
-                st.caption("（未取得建案清單：Qdrant 未連線或 collection 為空 → 將跨專案搜尋）")
+            _qurl = st.session_state.get("_chat_qdrant_url", QDRANT_DEFAULT_URL)
+            _qkey = st.session_state.get("_chat_qdrant_key", "")
+            _qcoll = st.session_state.get("_chat_qdrant_coll", QDRANT_TEXT_COLLECTION)
+            _proj_opts = list_projects_in_collection(_qurl, _qkey, _qcoll)
+            _dt_opts = list_doc_types_in_collection(_qurl, _qkey, _qcoll)
+            _bar_cols = st.columns(2)
+            with _bar_cols[0]:
+                sb_projects = st.multiselect(
+                    "🏗 指定專案（留空＝全部）",
+                    options=_proj_opts, default=[],
+                    key="_chat_filter_projects",
+                    help="留空＝搜整個 collection；勾選後只在這些建案內檢索（多選 OR）。",
+                )
+            with _bar_cols[1]:
+                sb_doc_types = st.multiselect(
+                    "📁 文件種類（留空＝全部）",
+                    options=_dt_opts, default=[],
+                    key="_chat_filter_doc_types",
+                    help="依 metadata.source.doc_type 篩文件種類，例如只搜法規規範（多選 OR）。",
+                )
+            if not _proj_opts and not _dt_opts:
+                st.caption("（未取得清單：Qdrant 未連線或 collection 為空 → 將不套用篩選）")
         else:
-            st.caption("🔗 RAG 已關閉（純 LLM 對話）—— 開啟後可在此指定專案")
+            st.caption("🔗 RAG 已關閉（純 LLM 對話）—— 開啟後可在此指定專案／文件種類")
 
     col_chat, col_imgs = st.columns([2, 1], gap="large")
 
@@ -2478,15 +2547,19 @@ def _render_chat_view() -> None:
                     st.warning(f"HyDE 失敗，fallback 用原 query：{e}")
                     embed_query_text = q
 
-            # 指定專案 filter：留空＝None＝跨專案全搜；有勾選才限定 project_name（OR）
-            chat_filter = None
+            # 篩選 filter：專案 + 文件種類各為一條 must（條內 OR、條間 AND）；皆留空＝None＝不篩
+            _must = []
             if sb_projects:
-                chat_filter = qm.Filter(must=[
-                    qm.FieldCondition(
-                        key="metadata.source.project_name",
-                        match=qm.MatchAny(any=list(sb_projects)),
-                    ),
-                ])
+                _must.append(qm.FieldCondition(
+                    key="metadata.source.project_name",
+                    match=qm.MatchAny(any=list(sb_projects)),
+                ))
+            if sb_doc_types:
+                _must.append(qm.FieldCondition(
+                    key="metadata.source.doc_type",
+                    match=qm.MatchAny(any=list(sb_doc_types)),
+                ))
+            chat_filter = qm.Filter(must=_must) if _must else None
 
             # 3. encode + search（失敗也走 _chat_fail，不留孤兒 user）
             try:
@@ -3184,6 +3257,44 @@ with tab_meta:
         (derive_image_label_key(s["headings"], s["body"]), s["image_paths"])
         for s in sections if s["image_paths"]
     ]
+
+    # === 區塊 0：文件種類（doc_type）—— 資料夾層級，套用到同資料夾所有檔案 ===
+    st.markdown("### 文件種類（doc_type）")
+    _dt_parts = split_key_parts(selected_key)
+    _dt_folder = _dt_parts[0] if len(_dt_parts) > 1 else ""
+    _dt_map = load_doc_type_map()
+    _cur_dt = resolve_doc_type(selected_key, load_sidecar(selected_key), _dt_map)
+    if _dt_folder:
+        st.caption(
+            f"資料夾 `{_dt_folder}` 目前 doc_type：**{_cur_dt}**"
+            f" · 套用到此資料夾下所有檔案 · 寫入 `{DOC_TYPE_MAP_PATH.name}`"
+            f"（優先序：sidecar 逐檔覆寫 > 資料夾對照表 > 未分類）"
+        )
+        _dt_cols = st.columns([3, 1], vertical_alignment="bottom")
+        with _dt_cols[0]:
+            _dt_new = st.text_input(
+                "doc_type 值",
+                value=_dt_map.get(_dt_folder, ""),
+                key=f"_doctype_input_{_dt_folder}",
+                placeholder="例如：專案報告 / 教育訓練 / 法規規範 / 部門規則（清空＝退回未分類）",
+                label_visibility="collapsed",
+            )
+        with _dt_cols[1]:
+            if st.button("套用到此資料夾", use_container_width=True, key="_doctype_apply"):
+                _dt_clean = _dt_new.strip()
+                if _dt_clean:
+                    _dt_map[_dt_folder] = _dt_clean
+                else:
+                    _dt_map.pop(_dt_folder, None)  # 清空＝移除對照，退回未分類
+                save_doc_type_map(_dt_map)
+                st.success(
+                    f"已設定 `{_dt_folder}` → {_dt_clean or DOC_TYPE_DEFAULT}"
+                    "（只改對照表、不動向量；舊資料需重新 encode/ingest 才帶上新值）"
+                )
+                st.rerun()
+    else:
+        st.caption("此檔不在子資料夾內（file_key 無上層資料夾）→ doc_type 為「未分類」。")
+    st.divider()
 
     # === 區塊 A：自動 heading + 圖片 標籤 ===
     st.markdown("### Heading & 圖片自動標籤")
@@ -3940,20 +4051,36 @@ with tab_search:
         for fk in file_keys
         if len(split_key_parts(fk)) > 1
     })
-    s_projects = st.multiselect(
-        "（選填）只搜這些建案", options=s_project_options, default=[],
-        key="search_filter_projects",
-        help="留空 = 搜整個 collection。多選用 OR。",
+    s_doc_type_options = list_doc_types_in_collection(
+        qdrant_url, qdrant_api_key, qdrant_collection_name
     )
+    s_fcols = st.columns(2)
+    with s_fcols[0]:
+        s_projects = st.multiselect(
+            "（選填）只搜這些建案", options=s_project_options, default=[],
+            key="search_filter_projects",
+            help="留空 = 搜整個 collection。多選用 OR。",
+        )
+    with s_fcols[1]:
+        s_doc_types = st.multiselect(
+            "（選填）只搜這些文件種類", options=s_doc_type_options, default=[],
+            key="search_filter_doc_types",
+            help="依 metadata.source.doc_type 篩。多選用 OR。",
+        )
 
-    s_filter = None
+    # 專案 + 文件種類各一條 must（條內 OR、條間 AND）；皆留空＝None＝不篩
+    _s_must = []
     if s_projects:
-        s_filter = qm.Filter(must=[
-            qm.FieldCondition(
-                key="metadata.source.project_name",
-                match=qm.MatchAny(any=list(s_projects)),
-            ),
-        ])
+        _s_must.append(qm.FieldCondition(
+            key="metadata.source.project_name",
+            match=qm.MatchAny(any=list(s_projects)),
+        ))
+    if s_doc_types:
+        _s_must.append(qm.FieldCondition(
+            key="metadata.source.doc_type",
+            match=qm.MatchAny(any=list(s_doc_types)),
+        ))
+    s_filter = qm.Filter(must=_s_must) if _s_must else None
 
     # === 執行檢索 ===
     if s_run and s_query.strip():
