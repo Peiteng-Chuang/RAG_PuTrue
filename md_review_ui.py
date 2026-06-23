@@ -125,7 +125,7 @@ AVAILABLE_EMBEDDERS = ["BAAI/bge-m3"]  # 之後可加 Qwen3-Embedding-4B 等
 QDRANT_TEXT_COLLECTION = "putrue_rag_text_v1"
 QDRANT_DEFAULT_URL = "http://localhost:6333"
 # Ollama 設定優先序：.env > 內建 fallback。對齊 pipeline.ipynb cell 7e8cd1b7
-OLLAMA_DEFAULT_URL = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_DEFAULT_URL = os.getenv("OLLAMA_HOST", "http://192.168.201.66:11434")
 OLLAMA_DEFAULT_MODEL = os.getenv("LLM_MODEL_NAME", "qwen3:32b")
 # 從 .env 動態組 model 選單：主 LLM + VLM（若有）。皆可在 UI 用 custom tag 覆寫
 _env_model_candidates = [
@@ -1278,6 +1278,32 @@ def get_ollama_client(host: str):
     )
 
 
+@st.cache_data(show_spinner=False, ttl=60)
+def list_ollama_models(host: str) -> list[str]:
+    """動態抓遠端 Ollama 主機已安裝的模型清單（/api/tags）。
+
+    給對話模式 model 下拉用。連線／查詢失敗回空 list，讓 UI 退回 .env 內建清單、不報錯。
+    cache 60s，避免每個 rerun 都打遠端（host 變動時 cache key 變 → 自動重抓）。
+    """
+    if not HAS_OLLAMA:
+        return []
+    try:
+        resp = get_ollama_client(host).list()
+        models = getattr(resp, "models", None)
+        if models is None and isinstance(resp, dict):
+            models = resp.get("models", [])
+        names = []
+        for m in models or []:
+            name = getattr(m, "model", None) or getattr(m, "name", None)
+            if name is None and isinstance(m, dict):
+                name = m.get("model") or m.get("name")
+            if name:
+                names.append(str(name))
+        return sorted(names)
+    except Exception:  # noqa: BLE001 — 取不到清單不可擋住對話 UI
+        return []
+
+
 def _ollama_stream_tokens(stream):
     """把 ollama stream 的各 part 拆出純文字 token，餵給 st.write_stream。
 
@@ -1710,23 +1736,41 @@ def _slim_sessions_for_storage(sessions: dict) -> dict:
 
 
 def _save_chat_sessions() -> None:
-    """把 chat_sessions + active id 存進『瀏覽器 localStorage』。
+    """標記對話紀錄為「待寫入瀏覽器」（mutation callback 用）。
+
+    ⚠️ 不在這裡直接 setItem：callback 內 setItem 後緊接 st.rerun()，會在元件 delta
+    flush 到前端「之前」就中止本次 script run → localStorage 從未真正寫入 → F5 後讀回空白。
+    這是先前 F5 清空的根因。改為僅清掉 dirty 快取，真正寫入延到
+    _render_chat_view() 尾端（正常完成的 render）由 _persist_chat_to_browser() 執行。
+    """
+    st.session_state.pop("_ls_last_blob", None)
+
+
+def _persist_chat_to_browser() -> None:
+    """把 chat_sessions + active id 實際寫入『瀏覽器 localStorage』。
+
+    只在 _render_chat_view() 尾端、render 正常完成（沒有緊接 st.rerun）時呼叫，setItem
+    元件 delta 才會 flush 到前端、真正落地 localStorage。dirty 比對（_ls_last_blob）讓
+    內容沒變就不重寫，避免每個 rerun 都打 setItem（兼省潛在 rerun 抖動）。
 
     退化版：不再寫 server 磁碟（舊版單一 chat_sessions.json 會被同 server 全團隊共用、
-    互看互蓋）。改存瀏覽器後每人各自獨立。無 localStorage 元件時退回純記憶體（本 session
-    有效、F5 即失），不中斷對話。
+    互看互蓋）。改存瀏覽器後每人各自獨立。無元件時退回純記憶體（F5 即失），不中斷對話。
     """
     if not HAS_LOCALSTORAGE:
         return
     try:
-        ls = _get_local_storage()
         payload = {
             "version": 2,
             "active": st.session_state.get("active_chat_session"),
             "sessions": _slim_sessions_for_storage(st.session_state.get("chat_sessions", {})),
         }
-        ls.setItem(CHAT_LS_KEY, json.dumps(payload, ensure_ascii=False), key="_ls_set_chat")
-        # 一旦自己存過，記憶體即為真相來源 → 別再讓啟動對帳用瀏覽器舊值覆蓋
+        blob = json.dumps(payload, ensure_ascii=False)
+        if st.session_state.get("_ls_last_blob") == blob:
+            return  # 內容無變動 → 不重寫
+        ls = _get_local_storage()
+        ls.setItem(CHAT_LS_KEY, blob, key="_ls_set_chat")
+        st.session_state["_ls_last_blob"] = blob
+        # 一旦自己寫過，記憶體即為真相來源 → 別再讓啟動對帳用瀏覽器舊值覆蓋
         st.session_state["_ls_chat_loaded"] = True
     except Exception as e:  # noqa: BLE001 — 持久化失敗不可中斷對話
         st.warning(f"聊天紀錄存入瀏覽器失敗（本輪仍在記憶體中）：{e}")
@@ -2144,7 +2188,9 @@ def _render_chat_view() -> None:
             value=st.session_state.get("_chat_ollama_url", OLLAMA_DEFAULT_URL),
             key="_chat_ollama_url",
         )
-        sb_model_options = list(OLLAMA_MODEL_CHOICES)
+        # 動態抓遠端主機模型清單（/api/tags）；抓不到（host 不通）退回 .env 內建清單
+        _remote_models = list_ollama_models(sb_ollama_url)
+        sb_model_options = _remote_models or list(OLLAMA_MODEL_CHOICES)
         sb_current = st.session_state.get("_chat_model", OLLAMA_DEFAULT_MODEL)
         if sb_current not in sb_model_options:
             sb_model_options.insert(0, sb_current)
@@ -2152,8 +2198,13 @@ def _render_chat_view() -> None:
             "Ollama Model", options=sb_model_options,
             index=sb_model_options.index(sb_current),
             key="_chat_model",
-            help="預設讀 .env LLM_MODEL_NAME。若清單無想要的 tag，在 Custom 自填",
+            help="清單動態抓自遠端 Ollama（/api/tags）；抓不到時退回 .env 內建。"
+                 "若清單無想要的 tag，在 Custom 自填",
         )
+        if not _remote_models:
+            st.caption("（未連上遠端 Ollama 或無模型 → 顯示 .env 內建清單）")
+        else:
+            st.caption(f"🟢 遠端 {len(_remote_models)} 個模型可用")
         sb_custom = st.text_input(
             "Custom model tag（覆寫上方）", value="",
             key="_chat_model_custom",
@@ -2507,8 +2558,12 @@ def _render_chat_view() -> None:
                     title = ""  # LLM 失敗 → 用 fallback
             active_sess["title"] = title or fallback_title
 
-        _save_chat_sessions()  # 每輪對話結束都存檔
+        _save_chat_sessions()  # 標記 dirty；實際寫入由下方尾端 persist 執行
         st.rerun()
+
+    # 持久化到瀏覽器：放在「正常完成的 render」尾端，setItem 元件 delta 才會 flush 到前端
+    # 真正落地（mutation callback 內 setItem→st.rerun 會在 flush 前被中止 → F5 清空的根因）。
+    _persist_chat_to_browser()
 
 
 # === 頂部 toolbar：右上角 view 切換鈕 ===
