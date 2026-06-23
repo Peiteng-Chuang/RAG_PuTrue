@@ -2706,109 +2706,49 @@ if not st.session_state.get("review_unlocked", False):
 # review 模式才顯示原標題
 st.title("PDF ↔ Markdown 比對 + Chunk Preview")
 
-with st.sidebar:
-    st.header("設定")
-    data_path_str = st.text_input(
-        "原始資料根目錄", DEFAULT_DATA_PATH,
-        help="process_tracker 內 file_key 的相對基底（PDF/PPT 來源）"
-    )
-    data_path = Path(data_path_str)
 
-    image_root_str = st.text_input(
-        "圖片根目錄", str(MKDATA_PATH),
-        help="包含全部 `{檔名}_image/` 子資料夾的目錄。"
-             "工具會用『檔名 + md 中圖片檔名』自動對應實體位置，"
-             "不依賴 md 內 ![]() 的相對路徑"
-    )
-    image_root = Path(image_root_str)
+def _render_fast_pipeline(
+    file_keys, _file_status_map, image_root, data_path,
+    qdrant_url, qdrant_api_key, qdrant_collection_name,
+):
+    """fast pipeline 主體：批次 encode → Qdrant。在 sidebar 內、通過密碼鎖後才呼叫。
 
-    auto_soffice = find_soffice()
-    soffice_override = st.text_input(
-        "LibreOffice 路徑（PPT/PPTX 預覽用）",
-        value=auto_soffice or "",
-        help="自動偵測；若未安裝可留空（PPT 將無法 PDF 預覽，但 md 編輯仍可用）。"
-             "或手動指定 soffice.exe 完整路徑。",
-    )
-    soffice_path = find_soffice(soffice_override.strip() or None)
-
-    if not TRACKER.exists():
-        st.error(f"找不到 {TRACKER}")
-        st.stop()
-    tracker = load_tracker()
-    file_keys = sorted(tracker.keys())
-
-    # 每個檔案的 review_status（從 sidecar 直接讀 disk）
-    _file_status_map: dict[str, str] = {
-        fk: get_file_status_quick(fk) for fk in file_keys
-    }
-    _status_counts: dict[str, int] = {s: 0 for s in REVIEW_STATUSES}
-    for s in _file_status_map.values():
-        _status_counts[s] = _status_counts.get(s, 0) + 1
-
-    selected_key = st.selectbox(
-        f"檔案 ({len(file_keys)} 個)",
-        file_keys,
-        format_func=lambda fk: (
-            f"{STATUS_BADGE[_file_status_map[fk]]['emoji']} "
-            f"[{STATUS_BADGE[_file_status_map[fk]]['label']}] {fk}"
-        ),
-        help="前綴 emoji 表示處理狀態，色票對應在下方圖例。"
-             "🔴未處理 / 🟡處理中 / 🟢處理完（已 encode）/ 🔵已寫入庫（已 upsert 到 Qdrant）",
-        key="sidebar_file_selectbox",
-    )
-
-    # 顏色圖例 + 各狀態檔案數
-    legend_chips = "".join(
-        f"<span style='display:inline-block; padding:3px 8px; margin:2px;"
-        f" border-radius:4px; background:{v['bg']}; color:{v['fg']};"
-        f" font-size:11px; font-weight:bold;'>"
-        f"{v['emoji']} {v['label']}：{_status_counts.get(k, 0)}"
-        f"</span>"
-        for k, v in STATUS_BADGE.items()
-    )
-    st.markdown(legend_chips, unsafe_allow_html=True)
-
-    dpi = st.slider("PDF 渲染 DPI", 60, 200, 110, step=10)
-
-    st.divider()
-    st.subheader("圖片校對顯示")
-    img_cols = st.slider("每列圖片數", 1, 5, 3)
-    img_width = st.slider("縮圖寬 (px)", 120, 480, 240, step=20)
-
-    st.divider()
-    st.subheader("Qdrant 連線")
-    qdrant_url = st.text_input(
-        "Qdrant URL", value=QDRANT_DEFAULT_URL,
-        help="Docker server endpoint，例如 http://localhost:6333",
-    )
-    qdrant_api_key = st.text_input(
-        "API key（選填）", value="", type="password",
-        help="本地 Docker 預設沒有 API key；server 模式如有開驗證再填",
-    )
-    qdrant_collection_name = st.text_input(
-        "Collection 名稱", value=QDRANT_TEXT_COLLECTION,
-        help="預設對齊 qdrant格式.md §2。改動代表寫到別的 collection",
-    )
-
-    # ============================================================
-    # fast pipeline：全庫批次 encode → Qdrant
-    # ============================================================
-    st.divider()
-    st.subheader("⚡ fast pipeline")
-
+    模式切換：
+      🛡 保護模式 → 略過已入庫(🔵)檔，只處理未入庫的（安全預設）。
+      ♻️ 全部重來 → 整批（含已入庫）重新 encode + 重新上傳；point_id deterministic 會原地
+                     覆蓋，適合改了 doc_type／chunk 規則後整資料夾重建。
+    """
     # 上一次批次結果（rerun 後才顯示，避免被 st.rerun 清掉）
     _fp_report = st.session_state.pop("_fastpipe_report", None)
     if _fp_report:
         (st.error if "失敗" in _fp_report else st.success)(_fp_report)
 
+    _fp_mode = st.segmented_control(
+        "批次模式",
+        options=["🛡 保護模式", "♻️ 全部重來"],
+        default="🛡 保護模式",
+        key="_fastpipe_mode",
+        help="保護模式：鎖定已入庫(🔵)檔、只處理未入庫。"
+             "全部重來：整批含已入庫重新 encode + 上傳（原地覆蓋）。",
+    )
+    _redo_all = (_fp_mode == "♻️ 全部重來")
+
     _fp_non_ingested = [fk for fk in file_keys if _file_status_map.get(fk) != "ingested"]
     _fp_encoded = [fk for fk in file_keys if _file_status_map.get(fk) == "encoded"]
+    if _redo_all:
+        _embed_targets = list(file_keys)     # 含已入庫，全部重新 encode
+        _upsert_targets = list(file_keys)    # 全部重新上傳
+    else:
+        _embed_targets = _fp_non_ingested    # 保護：略過已入庫
+        _upsert_targets = _fp_encoded
+
     st.caption(
-        f"非已入庫：**{len(_fp_non_ingested)}** 檔（可 embedding）｜"
-        f"已 encode 待入庫：**{len(_fp_encoded)}** 檔"
+        f"模式：**{'♻️ 全部重來' if _redo_all else '🛡 保護模式'}** ｜ "
+        f"待 embedding：**{len(_embed_targets)}** 檔 ｜ 待上傳：**{len(_upsert_targets)}** 檔"
     )
     st.caption(
         "⚠️ 批次會**跳過逐頁審閱關卡**，並使用**磁碟上已存檔的 md**（非未存的編輯緩衝）。"
+        + ("　🔴 全部重來會覆蓋已入庫資料！" if _redo_all else "")
     )
     _fp_confirm = st.checkbox(
         "我已確認上述 md 審閱完畢，可批次處理",
@@ -2857,7 +2797,7 @@ with st.sidebar:
                     )
                     st.rerun()
         st.caption(
-            "ℹ️ 只改對照表、不動向量。標記後需到上方「🧬 一鍵 embedding」+「🗄 更新資料庫」"
+            "ℹ️ 只改對照表、不動向量。標記後需到下方「🧬 一鍵 embedding」+「🗄 更新資料庫」"
             "重跑，新 doc_type 才會寫進 Qdrant。"
         )
 
@@ -2874,8 +2814,8 @@ with st.sidebar:
             "🧬 一鍵 embedding",
             type="primary",
             use_container_width=True,
-            disabled=(not _fp_confirm) or (len(_fp_non_ingested) == 0),
-            help=f"對 {len(_fp_non_ingested)} 個非已入庫檔批次 encode（已有有效快取者自動跳過）",
+            disabled=(not _fp_confirm) or (len(_embed_targets) == 0),
+            help=f"對 {len(_embed_targets)} 檔批次 encode（已有有效快取者自動跳過）",
             key="_fastpipe_embed_btn",
         ):
             try:
@@ -2885,9 +2825,9 @@ with st.sidebar:
                 st.rerun()
             n_enc = n_cache = n_empty = n_nohash = 0
             fails: list[str] = []
-            n = len(_fp_non_ingested)
+            n = len(_embed_targets)
             prog = st.progress(0.0, text="準備中...")
-            for fi, fk in enumerate(_fp_non_ingested):
+            for fi, fk in enumerate(_embed_targets):
                 prog.progress(fi / n, text=f"[{fi+1}/{n}] {Path(fk).name}")
                 try:
                     chunks, sc = build_chunks_from_disk(fk, image_root, data_path)
@@ -2901,8 +2841,8 @@ with st.sidebar:
                         continue
                     if vector_cache_status(fk, sc, ids)["valid"]:
                         n_cache += 1
-                        # 已有有效快取 = 已 embedding；非 ingested 就統一標成 encoded，
-                        # 讓「更新資料庫」能接手上傳（processing/unprocessed 都收斂過來）
+                        # 已有有效快取 = 已 embedding；非 encoded 就統一標成 encoded，
+                        # 讓「更新資料庫」能接手上傳（processing/unprocessed/ingested 都收斂過來）
                         if _file_status_map.get(fk) != "encoded":
                             set_status_on_disk(fk, sc, "encoded")
                         continue
@@ -2934,8 +2874,8 @@ with st.sidebar:
         if st.button(
             "🗄 更新資料庫",
             use_container_width=True,
-            disabled=(not _fp_confirm) or (len(_fp_encoded) == 0) or (not HAS_QDRANT),
-            help=f"把 {len(_fp_encoded)} 個已 encode 檔上傳到 Qdrant collection `{qdrant_collection_name}`",
+            disabled=(not _fp_confirm) or (len(_upsert_targets) == 0) or (not HAS_QDRANT),
+            help=f"把 {len(_upsert_targets)} 檔上傳到 Qdrant collection `{qdrant_collection_name}`",
             key="_fastpipe_upsert_btn",
         ):
             try:
@@ -2947,9 +2887,9 @@ with st.sidebar:
             n_up = n_skip_invalid = n_mismatch = n_empty = 0
             n_pts = 0
             fails = []
-            n = len(_fp_encoded)
+            n = len(_upsert_targets)
             prog = st.progress(0.0, text="準備中...")
-            for fi, fk in enumerate(_fp_encoded):
+            for fi, fk in enumerate(_upsert_targets):
                 prog.progress(fi / n, text=f"[{fi+1}/{n}] {Path(fk).name}")
                 try:
                     chunks, sc = build_chunks_from_disk(fk, image_root, data_path)
@@ -2990,6 +2930,130 @@ with st.sidebar:
                     rep += f"\n- …另 {len(fails) - 10} 檔"
             st.session_state["_fastpipe_report"] = rep
             st.rerun()
+
+
+with st.sidebar:
+    st.header("設定")
+    data_path_str = st.text_input(
+        "原始資料根目錄", DEFAULT_DATA_PATH,
+        help="process_tracker 內 file_key 的相對基底（PDF/PPT 來源）"
+    )
+    data_path = Path(data_path_str)
+
+    image_root_str = st.text_input(
+        "圖片根目錄", str(MKDATA_PATH),
+        help="包含全部 `{檔名}_image/` 子資料夾的目錄。"
+             "工具會用『檔名 + md 中圖片檔名』自動對應實體位置，"
+             "不依賴 md 內 ![]() 的相對路徑"
+    )
+    image_root = Path(image_root_str)
+
+    auto_soffice = find_soffice()
+    soffice_override = st.text_input(
+        "LibreOffice 路徑（PPT/PPTX 預覽用）",
+        value=auto_soffice or "",
+        help="自動偵測；若未安裝可留空（PPT 將無法 PDF 預覽，但 md 編輯仍可用）。"
+             "或手動指定 soffice.exe 完整路徑。",
+    )
+    soffice_path = find_soffice(soffice_override.strip() or None)
+
+    if not TRACKER.exists():
+        st.error(f"找不到 {TRACKER}")
+        st.stop()
+    tracker = load_tracker()
+    file_keys = sorted(tracker.keys())
+
+    # 每個檔案的 review_status（從 sidecar 直接讀 disk）
+    _file_status_map: dict[str, str] = {
+        fk: get_file_status_quick(fk) for fk in file_keys
+    }
+    _status_counts: dict[str, int] = {s: 0 for s in REVIEW_STATUSES}
+    for s in _file_status_map.values():
+        _status_counts[s] = _status_counts.get(s, 0) + 1
+
+    # 治本：selectbox 的選擇只靠 keyed widget 狀態記憶；在高頻 rerun（如 ace 編輯）下，
+    # 該狀態有機會被 Streamlit 丟失而 fallback 到 options[0]（字母序第一個檔＝別的專案），
+    # 進而觸發下方 loaded_file 重載、把畫面跳到其他專案。這裡在渲染前先校正 key：若值遺失
+    # 或不在清單，還原成「目前正在編輯的檔」(loaded_file)，否則退回第一個 → 杜絕靜默跳檔。
+    if file_keys:
+        _cur_sel = st.session_state.get("sidebar_file_selectbox")
+        if _cur_sel not in file_keys:
+            _restore = st.session_state.get("loaded_file")
+            st.session_state["sidebar_file_selectbox"] = (
+                _restore if _restore in file_keys else file_keys[0]
+            )
+
+    selected_key = st.selectbox(
+        f"檔案 ({len(file_keys)} 個)",
+        file_keys,
+        format_func=lambda fk: (
+            f"{STATUS_BADGE[_file_status_map[fk]]['emoji']} "
+            f"[{STATUS_BADGE[_file_status_map[fk]]['label']}] {fk}"
+        ),
+        help="前綴 emoji 表示處理狀態，色票對應在下方圖例。"
+             "🔴未處理 / 🟡處理中 / 🟢處理完（已 encode）/ 🔵已寫入庫（已 upsert 到 Qdrant）",
+        key="sidebar_file_selectbox",
+    )
+
+    # 顏色圖例 + 各狀態檔案數
+    legend_chips = "".join(
+        f"<span style='display:inline-block; padding:3px 8px; margin:2px;"
+        f" border-radius:4px; background:{v['bg']}; color:{v['fg']};"
+        f" font-size:11px; font-weight:bold;'>"
+        f"{v['emoji']} {v['label']}：{_status_counts.get(k, 0)}"
+        f"</span>"
+        for k, v in STATUS_BADGE.items()
+    )
+    st.markdown(legend_chips, unsafe_allow_html=True)
+
+    dpi = st.slider("PDF 渲染 DPI", 60, 200, 110, step=10)
+
+    st.divider()
+    st.subheader("圖片校對顯示")
+    img_cols = st.slider("每列圖片數", 1, 5, 3)
+    img_width = st.slider("縮圖寬 (px)", 120, 480, 240, step=20)
+
+    st.divider()
+    st.subheader("Qdrant 連線")
+    qdrant_url = st.text_input(
+        "Qdrant URL", value=QDRANT_DEFAULT_URL,
+        help="Docker server endpoint，例如 http://localhost:6333",
+    )
+    qdrant_api_key = st.text_input(
+        "API key（選填）", value="", type="password",
+        help="本地 Docker 預設沒有 API key；server 模式如有開驗證再填",
+    )
+    qdrant_collection_name = st.text_input(
+        "Collection 名稱", value=QDRANT_TEXT_COLLECTION,
+        help="預設對齊 qdrant格式.md §2。改動代表寫到別的 collection",
+    )
+
+    # ============================================================
+    # fast pipeline：全庫批次 encode → Qdrant（密碼鎖 + 模式切換）
+    # ============================================================
+    st.divider()
+    st.subheader("⚡ fast pipeline")
+    # 密碼鎖：與審閱模式同一組密碼；解鎖後才看得到選項與功能（批次寫入多一道閘）。
+    if not st.session_state.get("_fastpipe_unlocked", False):
+        st.caption("🔒 批次寫入操作，需密碼解鎖（與審閱模式相同）才能看到選項與使用。")
+        with st.form("_fastpipe_unlock_form"):
+            _fp_pw = st.text_input("密碼", type="password", key="_fastpipe_pw")
+            if st.form_submit_button("解鎖 fast pipeline"):
+                if _fp_pw == REVIEW_PASSWORD:
+                    st.session_state["_fastpipe_unlocked"] = True
+                    st.rerun()
+                else:
+                    st.error("密碼錯誤")
+    else:
+        _fp_lock_cols = st.columns([3, 1])
+        _fp_lock_cols[0].caption("🔓 已解鎖")
+        if _fp_lock_cols[1].button("🔒 鎖定", key="_fastpipe_lock_btn", use_container_width=True):
+            st.session_state["_fastpipe_unlocked"] = False
+            st.rerun()
+        _render_fast_pipeline(
+            file_keys, _file_status_map, image_root, data_path,
+            qdrant_url, qdrant_api_key, qdrant_collection_name,
+        )
 
     st.divider()
     st.caption("提示：編輯區失焦（Tab/點擊外部）後才會自動同步到完整 md。"
