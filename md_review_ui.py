@@ -2358,21 +2358,28 @@ def _render_chat_view() -> None:
         st.warning("尚無 active session。請點左側「➕ 新對話」")
         return
 
-    # === 聊天室正上方「指定專案」sticky bar ===
+    # === 聊天室正上方「指定專案／文件種類」sticky bar ===
     # 釘在 Streamlit header 下方（position:sticky），捲動對話歷史時固定不被泡泡蓋住。
-    # 留空＝跨專案全搜；勾選後才加 project filter（比照審閱模式 Tab 6）。
+    # 背景隨主題自適應：用 st.context.theme.type（依實際背景推斷 light/dark）挑色，
+    # 取代先前寫死的白底（深色主題下會出現白方塊）。
+    try:
+        _theme_type = st.context.theme.type or "light"
+    except Exception:  # noqa: BLE001 — 取不到主題就當淺色
+        _theme_type = "light"
+    _bar_bg = "#0e1117" if _theme_type == "dark" else "#ffffff"
+    _bar_border = "rgba(250,250,250,0.20)" if _theme_type == "dark" else "rgba(0,0,0,0.10)"
     st.markdown(
-        """
+        f"""
         <style>
-        .st-key-chat_project_bar {
+        .st-key-chat_project_bar {{
             position: sticky;
             top: 3.75rem;            /* ≈ Streamlit 固定 header 高度，貼其下方不被蓋住 */
             z-index: 100;
-            background: var(--background-color, #ffffff);
+            background: {_bar_bg};
             padding: 0.45rem 0.2rem;
             margin-bottom: 0.3rem;
-            border-bottom: 1px solid rgba(128, 128, 128, 0.25);
-        }
+            border-bottom: 1px solid {_bar_border};
+        }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -2386,21 +2393,19 @@ def _render_chat_view() -> None:
             _qcoll = st.session_state.get("_chat_qdrant_coll", QDRANT_TEXT_COLLECTION)
             _proj_opts = list_projects_in_collection(_qurl, _qkey, _qcoll)
             _dt_opts = list_doc_types_in_collection(_qurl, _qkey, _qcoll)
-            _bar_cols = st.columns(2)
-            with _bar_cols[0]:
-                sb_projects = st.multiselect(
-                    "🏗 指定專案（留空＝全部）",
-                    options=_proj_opts, default=[],
-                    key="_chat_filter_projects",
-                    help="留空＝搜整個 collection；勾選後只在這些建案內檢索（多選 OR）。",
-                )
-            with _bar_cols[1]:
-                sb_doc_types = st.multiselect(
-                    "📁 文件種類（留空＝全部）",
-                    options=_dt_opts, default=[],
-                    key="_chat_filter_doc_types",
-                    help="依 metadata.source.doc_type 篩文件種類，例如只搜法規規範（多選 OR）。",
-                )
+            # 兩個下拉同欄堆疊（不再左右分欄，避免擠成窄方塊）
+            sb_projects = st.multiselect(
+                "🏗 指定專案（留空＝全部）",
+                options=_proj_opts, default=[],
+                key="_chat_filter_projects",
+                help="留空＝搜整個 collection；勾選後只在這些建案內檢索（多選 OR）。",
+            )
+            sb_doc_types = st.multiselect(
+                "📁 文件種類（留空＝全部）",
+                options=_dt_opts, default=[],
+                key="_chat_filter_doc_types",
+                help="依 metadata.source.doc_type 篩文件種類，例如只搜法規規範（多選 OR）。",
+            )
             if not _proj_opts and not _dt_opts:
                 st.caption("（未取得清單：Qdrant 未連線或 collection 為空 → 將不套用篩選）")
         else:
@@ -2809,6 +2814,52 @@ with st.sidebar:
         "我已確認上述 md 審閱完畢，可批次處理",
         key="_fastpipe_confirm",
     )
+
+    # ---- 文件種類一鍵標記（folder → doc_type 對照表）----
+    with st.expander("📁 文件種類一鍵標記（folder → doc_type）", expanded=False):
+        _all_folders = sorted({
+            split_key_parts(fk)[0] for fk in file_keys if len(split_key_parts(fk)) > 1
+        })
+        _dtmap_fp = load_doc_type_map()
+        if _dtmap_fp:
+            st.caption("目前對照：" + " · ".join(
+                f"`{k}`→{v}" for k, v in sorted(_dtmap_fp.items())
+            ))
+        else:
+            st.caption("目前對照表為空（皆為「未分類」）。")
+        _mk_cols = st.columns([2, 2, 1], vertical_alignment="bottom")
+        with _mk_cols[0]:
+            _sel_folders = st.multiselect(
+                "選資料夾（可多選）", options=_all_folders, default=[],
+                key="_fp_doctype_folders",
+                help="一次選多個資料夾，套用同一個 doc_type",
+            )
+        with _mk_cols[1]:
+            _dt_val = st.text_input(
+                "doc_type", value="", key="_fp_doctype_value",
+                placeholder="專案報告 / 教育訓練 / 法規規範 / 部門規則（清空＝移除）",
+            )
+        with _mk_cols[2]:
+            if st.button("🏷 標記", use_container_width=True, key="_fp_doctype_apply"):
+                if not _sel_folders:
+                    st.warning("請先選至少一個資料夾")
+                else:
+                    _v = _dt_val.strip()
+                    _m = load_doc_type_map()
+                    for f in _sel_folders:
+                        if _v:
+                            _m[f] = _v
+                        else:
+                            _m.pop(f, None)  # 清空＝移除對照，退回未分類
+                    save_doc_type_map(_m)
+                    st.success(
+                        f"已標記 {len(_sel_folders)} 個資料夾 → {_v or DOC_TYPE_DEFAULT}"
+                    )
+                    st.rerun()
+        st.caption(
+            "ℹ️ 只改對照表、不動向量。標記後需到上方「🧬 一鍵 embedding」+「🗄 更新資料庫」"
+            "重跑，新 doc_type 才會寫進 Qdrant。"
+        )
 
     # 模型參數沿用 Tab 4 的設定（session_state），首次未開 Tab 4 時用預設
     _fp_model = st.session_state.get("embed_model", EMBEDDING_MODEL)
