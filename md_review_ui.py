@@ -1379,6 +1379,31 @@ def get_collection_total(client, name: str) -> int:
         return 0
 
 
+@st.cache_data(show_spinner=False, ttl=300)
+def list_projects_in_collection(url: str, api_key: str, coll: str) -> list[str]:
+    """列出某 collection 內所有 distinct 建案名（metadata.source.project_name）。
+
+    用 Qdrant facet API 取 distinct 值，給對話模式「指定專案」多選清單用（對話模式取不到
+    審閱模式的 file_keys，改從實際 ingest 進去的資料反查更準）。連線／查詢失敗回空 list，
+    讓 UI 退回跨專案全搜、不報錯。cache 5 分鐘，避免每次 rerun 都打 Qdrant。
+    """
+    try:
+        cli = get_qdrant_client(url, api_key)
+        if not cli.collection_exists(coll):
+            return []
+        resp = cli.facet(
+            collection_name=coll,
+            key="metadata.source.project_name",
+            limit=1000,
+        )
+        return sorted(
+            h.value for h in resp.hits
+            if isinstance(getattr(h, "value", None), str) and h.value
+        )
+    except Exception:  # noqa: BLE001 — 取不到清單不可擋住對話 UI
+        return []
+
+
 def load_cached_vectors(file_key: str) -> tuple[np.ndarray, list[dict], dict]:
     """讀 mkdata/{stem}.vectors.* 三件套；dense 自動還原為 fp32。"""
     paths = derive_vector_paths(file_key)
@@ -2163,6 +2188,25 @@ def _render_chat_view() -> None:
                 help="關掉 = 純 LLM 對話（不檢索）",
             )
 
+            # 指定專案搜尋（預設留空＝跨專案全搜；勾選後才像審閱模式 Tab 6 那樣加 project filter）。
+            # 建案清單從 collection facet 反查（連線設定的 widget key 已 persist 於 session_state）。
+            sb_projects: list[str] = []
+            if sb_rag_on:
+                _proj_opts = list_projects_in_collection(
+                    st.session_state.get("_chat_qdrant_url", QDRANT_DEFAULT_URL),
+                    st.session_state.get("_chat_qdrant_key", ""),
+                    st.session_state.get("_chat_qdrant_coll", QDRANT_TEXT_COLLECTION),
+                )
+                sb_projects = st.multiselect(
+                    "🏗 指定專案（留空＝跨專案全搜）",
+                    options=_proj_opts,
+                    default=[],
+                    key="_chat_filter_projects",
+                    help="留空時搜整個 collection；勾選後只在這些建案內檢索（多選用 OR，比照 Tab 6）。",
+                )
+                if not _proj_opts:
+                    st.caption("（未取得建案清單：Qdrant 未連線或 collection 為空 → 將跨專案搜尋）")
+
         # LLM 參數
         with st.expander("⚙️ LLM 參數", expanded=False):
             sb_temp = st.slider(
@@ -2350,16 +2394,26 @@ def _render_chat_view() -> None:
                     st.warning(f"HyDE 失敗，fallback 用原 query：{e}")
                     embed_query_text = q
 
+            # 指定專案 filter：留空＝None＝跨專案全搜；有勾選才限定 project_name（OR）
+            chat_filter = None
+            if sb_projects:
+                chat_filter = qm.Filter(must=[
+                    qm.FieldCondition(
+                        key="metadata.source.project_name",
+                        match=qm.MatchAny(any=list(sb_projects)),
+                    ),
+                ])
+
             # 3. encode + search（失敗也走 _chat_fail，不留孤兒 user）
             try:
                 with st.spinner(f"檢索中（{sb_search_mode} top-{sb_top_k}）..."):
                     q_dense, q_sparse = encode_query(embedder, embed_query_text)
                     if sb_search_mode == "dense":
-                        hits = search_dense(cli, sb_qdrant_coll, q_dense, int(sb_top_k), None)
+                        hits = search_dense(cli, sb_qdrant_coll, q_dense, int(sb_top_k), chat_filter)
                     elif sb_search_mode == "sparse":
-                        hits = search_sparse(cli, sb_qdrant_coll, q_sparse, int(sb_top_k), None)
+                        hits = search_sparse(cli, sb_qdrant_coll, q_sparse, int(sb_top_k), chat_filter)
                     else:
-                        hits = search_hybrid(cli, sb_qdrant_coll, q_dense, q_sparse, int(sb_top_k), None)
+                        hits = search_hybrid(cli, sb_qdrant_coll, q_dense, q_sparse, int(sb_top_k), chat_filter)
             except Exception as e:
                 _chat_fail(active_sess, f"⚠️ 檢索失敗：\n```\n{e}\n```")
             rag_chunks = [{"score": h.score, "payload": h.payload or {}} for h in hits]
