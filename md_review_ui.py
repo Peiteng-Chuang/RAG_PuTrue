@@ -2374,7 +2374,18 @@ def _render_chat_view() -> None:
         # 泡泡寫進這裡，確保串流內容渲染在正確的對話欄位、且 websocket 持續有流量。
         live_turn = st.container()
 
-        user_q = st.chat_input("輸入問題（Enter 送出）...")
+        # 輸入列：送出箭頭旁加「🤖 LLM」開關。關閉＝僅檢索模式（不呼叫 LLM，回覆「查詢到 N 個
+        # 相關文件」並展示 RAG 來源／圖片）。
+        in_cols = st.columns([6, 1], vertical_alignment="bottom")
+        with in_cols[0]:
+            user_q = st.chat_input("輸入問題（Enter 送出）...")
+        with in_cols[1]:
+            sb_llm_on = st.toggle(
+                "🤖 LLM",
+                value=st.session_state.get("_chat_llm_on", True),
+                key="_chat_llm_on",
+                help="開＝LLM 生成回答；關＝僅檢索，回覆「查詢到 N 個相關文件」並展示來源（完全不呼叫 LLM）",
+            )
 
     with col_imgs:
         st.subheader("🖼 相關圖片")
@@ -2431,11 +2442,12 @@ def _render_chat_view() -> None:
             with st.chat_message("user"):
                 st.markdown(q)
 
-        # 1. RAG（可選）
+        # 1. RAG 檢索：RAG 開啟，或 LLM 關閉（僅檢索模式必須有結果可展示）時都要跑
         rag_chunks: list[dict] = []
-        if sb_rag_on:
+        do_retrieval = sb_rag_on or not sb_llm_on
+        if do_retrieval:
             if not HAS_QDRANT:
-                _chat_fail(active_sess, "⚠️ RAG on 但 `qdrant-client` 未安裝。請關掉 RAG 或安裝 qdrant-client。")
+                _chat_fail(active_sess, "⚠️ 需要檢索但 `qdrant-client` 未安裝。請安裝，或開啟 LLM 改用純對話。")
             try:
                 cli = get_qdrant_client(sb_qdrant_url, sb_qdrant_key)
             except Exception as e:
@@ -2456,9 +2468,9 @@ def _render_chat_view() -> None:
 
             ollama_cli = get_ollama_client(sb_ollama_url)
 
-            # 2. HyDE 改寫（可選）
+            # 2. HyDE 改寫（可選；LLM 關閉時不做，避免任何 LLM 呼叫）
             embed_query_text = q
-            if sb_hyde:
+            if sb_hyde and sb_llm_on:
                 try:
                     with st.spinner("HyDE 改寫中..."):
                         embed_query_text = llm_generate_hyde(ollama_cli, active_model, q)
@@ -2492,48 +2504,56 @@ def _render_chat_view() -> None:
         else:
             ollama_cli = get_ollama_client(sb_ollama_url)
 
-        # 4. 組 messages
-        sys_prompt = LLM_RAG_SYSTEM_PROMPT if sb_rag_on else LLM_DEFAULT_SYSTEM_PROMPT
-        messages = [{"role": "system", "content": sys_prompt}]
-        # 歷史（不含剛加的 user msg）
-        prior = active_sess["messages"][:-1]
-        # 防呆：剝除結尾孤兒 user（無對應 assistant），避免送出連續兩個 user role
-        # 導致部分模型回空字串。正常交替歷史結尾為 assistant → 此迴圈不觸發、零 context 損失。
-        while prior and prior[-1].get("role") == "user":
-            prior = prior[:-1]
-        messages.extend(prior[-10:])  # 保留近 5 輪（user+assistant）
-        if rag_chunks:
-            ctx_text = llm_format_chunks(rag_chunks)
-            messages.append({
-                "role": "user",
-                "content": f"【參考資料】\n{ctx_text}\n\n【問題】\n{q}",
-            })
-        else:
-            messages.append({"role": "user", "content": q})
+        if sb_llm_on:
+            # 4. 組 messages
+            sys_prompt = LLM_RAG_SYSTEM_PROMPT if rag_chunks else LLM_DEFAULT_SYSTEM_PROMPT
+            messages = [{"role": "system", "content": sys_prompt}]
+            # 歷史（不含剛加的 user msg）
+            prior = active_sess["messages"][:-1]
+            # 防呆：剝除結尾孤兒 user（無對應 assistant），避免送出連續兩個 user role
+            # 導致部分模型回空字串。正常交替歷史結尾為 assistant → 此迴圈不觸發、零 context 損失。
+            while prior and prior[-1].get("role") == "user":
+                prior = prior[:-1]
+            messages.extend(prior[-10:])  # 保留近 5 輪（user+assistant）
+            if rag_chunks:
+                ctx_text = llm_format_chunks(rag_chunks)
+                messages.append({
+                    "role": "user",
+                    "content": f"【參考資料】\n{ctx_text}\n\n【問題】\n{q}",
+                })
+            else:
+                messages.append({"role": "user", "content": q})
 
-        # 5. LLM 呼叫（串流）—— 底層斷線治本：生成期間 token 持續流過 websocket，
-        # 連線不會 idle、UI 即時逐字更新。answer = 串流全文（st.write_stream 回傳）。
-        try:
+            # 5. LLM 呼叫（串流）—— 底層斷線治本：生成期間 token 持續流過 websocket，
+            # 連線不會 idle、UI 即時逐字更新。answer = 串流全文（st.write_stream 回傳）。
+            answer = ""
+            try:
+                with live_turn:
+                    with st.chat_message("assistant"):
+                        stream = ollama_cli.chat(
+                            model=active_model,
+                            messages=messages,
+                            options={
+                                "num_ctx": int(sb_num_ctx),
+                                "temperature": float(sb_temp),
+                                "top_p": float(sb_top_p),
+                                "num_predict": int(sb_num_predict),
+                            },
+                            stream=True,
+                        )
+                        answer = st.write_stream(_ollama_stream_tokens(stream))
+            except Exception as e:
+                _chat_fail(active_sess, f"⚠️ LLM 呼叫失敗：`{e}`", chunks=rag_chunks)
+
+            # 空回答防呆：模型偶爾回空字串（num_predict 太小／上下文異常）→ 別塞空白泡泡
+            if not (answer or "").strip():
+                answer = "⚠️ 模型回傳空內容（可能 num_predict 太小或上下文異常）。請重試，或調整 num_predict／檢查對話歷史。"
+        else:
+            # LLM 關閉 → 僅檢索模式：固定回覆 + 由下方來源 expander／右欄圖片展示 RAG 結果
+            answer = f"查詢到 {len(rag_chunks)} 個相關文件"
             with live_turn:
                 with st.chat_message("assistant"):
-                    stream = ollama_cli.chat(
-                        model=active_model,
-                        messages=messages,
-                        options={
-                            "num_ctx": int(sb_num_ctx),
-                            "temperature": float(sb_temp),
-                            "top_p": float(sb_top_p),
-                            "num_predict": int(sb_num_predict),
-                        },
-                        stream=True,
-                    )
-                    answer = st.write_stream(_ollama_stream_tokens(stream))
-        except Exception as e:
-            _chat_fail(active_sess, f"⚠️ LLM 呼叫失敗：`{e}`", chunks=rag_chunks)
-
-        # 空回答防呆：模型偶爾回空字串（num_predict 太小／上下文異常）→ 別塞空白泡泡
-        if not (answer or "").strip():
-            answer = "⚠️ 模型回傳空內容（可能 num_predict 太小或上下文異常）。請重試，或調整 num_predict／檢查對話歷史。"
+                    st.markdown(answer)
 
         active_sess["messages"].append({
             "role": "assistant",
@@ -2550,7 +2570,7 @@ def _render_chat_view() -> None:
             )
             fallback_title = first_user[:20] + ("…" if len(first_user) > 20 else "")
             title = ""
-            if llm_generate_title is not None:
+            if sb_llm_on and llm_generate_title is not None:
                 try:
                     with st.spinner("產生對話標題中..."):
                         title = llm_generate_title(ollama_cli, active_model, first_user)
