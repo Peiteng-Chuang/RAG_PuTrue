@@ -98,7 +98,7 @@ TRASH_DIR.mkdir(exist_ok=True)
 
 
 # === 系統常數（對齊 qdrant格式.md v2.1.0） ===
-PIPELINE_VERSION = "2.1.0"   # 2.1.0：新增 metadata.source.doc_type（文件種類）欄位 + 索引
+PIPELINE_VERSION = "2.1.1"   # 2.1.1：project_name=file_key[1]（建案）、doc_type fallback=file_key[0]（類別）
 EMBEDDING_MODEL = "BAAI/bge-m3"
 EMBEDDING_VERSION = "v1"
 EMBEDDING_DIM_DENSE = 1024
@@ -395,8 +395,10 @@ def save_doc_type_map(mapping: dict) -> None:
 
 
 def resolve_doc_type(file_key: str, sidecar: dict, doc_type_map: dict | None = None) -> str:
-    """決定某檔的文件種類，優先序：sidecar 逐檔覆寫 > 資料夾對照表 > 預設「未分類」。
+    """決定某檔的文件種類，優先序：sidecar 逐檔覆寫 > 資料夾對照表 > **最上層資料夾名** > 未分類。
 
+    「資料夾名即類型」：data_root 設在最上層時 file_key[0] = 類別資料夾名，預設直接拿它當
+    doc_type（零維護）。對照表只在「資料夾名 ≠ 想要的 doc_type」時用來翻譯（覆寫）。
     傳入 doc_type_map 可避免在批次 chunk 迴圈裡反覆讀檔；未傳則自行載入。
     """
     override = (sidecar or {}).get("doc_type")
@@ -405,7 +407,21 @@ def resolve_doc_type(file_key: str, sidecar: dict, doc_type_map: dict | None = N
     parts = split_key_parts(file_key)
     folder = parts[0] if len(parts) > 1 else ""
     dtm = doc_type_map if doc_type_map is not None else load_doc_type_map()
-    return str(dtm.get(folder) or DOC_TYPE_DEFAULT)
+    return str(dtm.get(folder) or folder or DOC_TYPE_DEFAULT)
+
+
+def derive_project_name(file_key: str) -> str:
+    """建案名 = file_key 第二段（結構為 類別/建案/…/檔 → 取 建案）。
+
+    類別 = file_key[0]（給 doc_type），建案 = file_key[1]，兩者正交。
+    無建案層（類別/檔）退回第一段；只有檔名退回未分類。
+    """
+    parts = split_key_parts(file_key)
+    if len(parts) >= 3:
+        return parts[1]
+    if len(parts) == 2:
+        return parts[0]
+    return "未分類"
 
 
 def now_iso() -> str:
@@ -943,7 +959,7 @@ def build_chunk_payload(
 
     doc_type 由呼叫端（每份文件）算好一次傳入，避免在 chunk 迴圈反覆讀對照表；未傳則自行解析。"""
     parts = split_key_parts(file_key)
-    project_name = parts[0] if len(parts) > 1 else "未分類"
+    project_name = derive_project_name(file_key)  # 建案 = file_key[1]（類別在 [0]）
     doc_type = doc_type if doc_type is not None else resolve_doc_type(file_key, sidecar)
     file_name = parts[-1]
     file_stem = Path(file_name).stem
@@ -3151,7 +3167,7 @@ current_idx = st.session_state.page_idx
 page_num, page_md = pages[current_idx]
 
 parts = split_key_parts(selected_key)
-project_name = parts[0] if len(parts) > 1 else "未分類"
+project_name = derive_project_name(selected_key)  # 建案 = file_key[1]（類別在 [0]）
 file_name = parts[-1]
 sidecar = st.session_state.sidecars[selected_key]
 file_hash_display = sidecar.get("file_hash") or fm.get("file_hash", "—") or "—"
@@ -4157,8 +4173,10 @@ with tab_search:
         )
 
     # === Filter ===
+    # 建案選項用 derive_project_name（= file_key[1]），對齊 payload 的 project_name；
+    # 用 file_key[0] 會列成「類別」而與 payload 對不上、filter 撈不到。
     s_project_options = sorted({
-        split_key_parts(fk)[0]
+        derive_project_name(fk)
         for fk in file_keys
         if len(split_key_parts(fk)) > 1
     })
