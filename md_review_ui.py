@@ -54,9 +54,9 @@ except ImportError:
     qm = None
     HAS_QDRANT = False
 
-# Ollama + ChatBot（對話模式用；缺失時切到對話模式會 disable）
+# vLLM（OpenAI 相容 API）+ ChatBot（對話模式用；缺失時切到對話模式會 disable）
 try:
-    from ollama import Client as OllamaClient
+    from openai import OpenAI
     from llm_chat import (
         ChatBot,
         DEFAULT_SYSTEM_PROMPT as LLM_DEFAULT_SYSTEM_PROMPT,
@@ -65,16 +65,16 @@ try:
         generate_hyde as llm_generate_hyde,
         generate_title as llm_generate_title,
     )
-    HAS_OLLAMA = True
+    HAS_LLM = True
 except ImportError:
-    OllamaClient = None
+    OpenAI = None
     ChatBot = None
     LLM_DEFAULT_SYSTEM_PROMPT = ""
     LLM_RAG_SYSTEM_PROMPT = ""
     llm_format_chunks = None
     llm_generate_hyde = None
     llm_generate_title = None
-    HAS_OLLAMA = False
+    HAS_LLM = False
 
 # 對話紀錄「瀏覽器 localStorage」持久化（退化版：不再寫 server 磁碟，多人共用 server 時各自獨立）
 try:
@@ -128,17 +128,16 @@ AVAILABLE_EMBEDDERS = ["BAAI/bge-m3"]  # 之後可加 Qwen3-Embedding-4B 等
 # === Qdrant 常數（對齊 qdrant格式.md §2）===
 QDRANT_TEXT_COLLECTION = "putrue_rag_text_v1"
 QDRANT_DEFAULT_URL = "http://localhost:6333"
-# Ollama 設定優先序：.env > 內建 fallback。對齊 pipeline.ipynb cell 7e8cd1b7
-OLLAMA_DEFAULT_URL = os.getenv("OLLAMA_HOST", "http://192.168.201.66:11434")
-OLLAMA_DEFAULT_MODEL = os.getenv("LLM_MODEL_NAME", "qwen3:32b")
-# 從 .env 動態組 model 選單：主 LLM + VLM（若有）。皆可在 UI 用 custom tag 覆寫
+# vLLM（OpenAI 相容）設定優先序：.env > 內建 fallback
+LLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://192.168.201.66:8000/v1")
+LLM_API_KEY = os.getenv("VLLM_API_KEY", "EMPTY")  # vLLM 不驗 key，但 OpenAI client 需非空字串
+LLM_DEFAULT_MODEL = os.getenv("LLM_MODEL_NAME", "")  # 實際 model id 由 /v1/models 動態抓
+# .env 內建 model 候選（抓不到 /v1/models 時的 fallback）
 _env_model_candidates = [
     os.getenv("LLM_MODEL_NAME"),
     os.getenv("VLM_MODEL_NAME"),
 ]
-OLLAMA_MODEL_CHOICES = [m for m in _env_model_candidates if m]
-if not OLLAMA_MODEL_CHOICES:
-    OLLAMA_MODEL_CHOICES = [OLLAMA_DEFAULT_MODEL]
+LLM_MODEL_CHOICES = [m for m in _env_model_candidates if m]
 LLM_DEFAULT_TOP_K = 8
 LLM_DEFAULT_TEMPERATURE = 0.7   # 對齊 pipeline.ipynb + llm_chat.ChatBot 預設
 LLM_DEFAULT_TOP_P = 0.9
@@ -1307,59 +1306,53 @@ def get_qdrant_client(url: str, api_key: str):
 
 
 @st.cache_resource(show_spinner=False)
-def get_ollama_client(host: str):
-    """Cached Ollama client（host 改變自動建新 entry）。
+def get_llm_client(base_url: str):
+    """Cached OpenAI 相容 client，指向 vLLM 的 /v1。base_url 改變自動建新 entry。
 
-    底層斷線防護：ollama 預設 `timeout=None`（httpx 永不逾時），遠端 ollama
-    （跨機）卡住／重載模型時，會把整個 Streamlit rerun 永久阻塞、websocket idle
-    被部屬層剪斷。這裡給有界逾時 —— 串流模式下 read timeout 是「相鄰兩個 token
-    之間」的上限，不是整段生成上限，所以 300s 對慢的首 token 也夠寬。
+    有界逾時：串流模式下 read timeout 是「相鄰兩 token 之間」的上限，不是整段生成上限，
+    300s 對慢的首 token 也夠寬；connect 10s 避免遠端不通時整個 rerun 卡死。
     """
     import httpx
-    return OllamaClient(
-        host=host,
+    return OpenAI(
+        base_url=base_url,
+        api_key=LLM_API_KEY,
         timeout=httpx.Timeout(300.0, connect=10.0),
+        max_retries=1,
     )
 
 
 @st.cache_data(show_spinner=False, ttl=60)
-def list_ollama_models(host: str) -> list[str]:
-    """動態抓遠端 Ollama 主機已安裝的模型清單（/api/tags）。
+def list_llm_models(base_url: str) -> list[str]:
+    """動態抓 vLLM 服務的模型清單（GET /v1/models）。
 
     給對話模式 model 下拉用。連線／查詢失敗回空 list，讓 UI 退回 .env 內建清單、不報錯。
-    cache 60s，避免每個 rerun 都打遠端（host 變動時 cache key 變 → 自動重抓）。
+    cache 60s（base_url 變動時 cache key 變 → 自動重抓）。
     """
-    if not HAS_OLLAMA:
+    if not HAS_LLM:
         return []
     try:
-        resp = get_ollama_client(host).list()
-        models = getattr(resp, "models", None)
-        if models is None and isinstance(resp, dict):
-            models = resp.get("models", [])
-        names = []
-        for m in models or []:
-            name = getattr(m, "model", None) or getattr(m, "name", None)
-            if name is None and isinstance(m, dict):
-                name = m.get("model") or m.get("name")
-            if name:
-                names.append(str(name))
-        return sorted(names)
+        resp = get_llm_client(base_url).models.list()
+        return sorted(m.id for m in resp.data if getattr(m, "id", None))
     except Exception:  # noqa: BLE001 — 取不到清單不可擋住對話 UI
         return []
 
 
-def _ollama_stream_tokens(stream):
-    """把 ollama stream 的各 part 拆出純文字 token，餵給 st.write_stream。
+def _llm_stream_tokens(stream):
+    """從 OpenAI 相容串流（vLLM）逐塊取出 delta.content，餵給 st.write_stream。
 
-    串流是底層斷線的治本解：生成期間 websocket 持續有資料流動，連線不會被
-    判定為 idle 而遭部屬層（proxy / 瀏覽器）剪斷，UI 也即時更新不再全凍。
-    與既有程式一致用 subscript 取值（此 ollama 版本支援）。
+    串流是底層斷線的治本解：生成期間 websocket 持續有資料流動，連線不會被判定為 idle
+    而遭部屬層（proxy / 瀏覽器）剪斷，UI 也即時更新不再全凍。
     """
-    for part in stream:
-        tok = (part.get("message") or {}).get("content", "") if isinstance(part, dict) \
-            else (getattr(getattr(part, "message", None), "content", "") or "")
-        if tok:
-            yield tok
+    for chunk in stream:
+        try:
+            choices = getattr(chunk, "choices", None)
+            if not choices:
+                continue
+            tok = getattr(choices[0].delta, "content", None)
+            if tok:
+                yield tok
+        except Exception:  # noqa: BLE001 — 單塊解析失敗不該中斷整串流
+            continue
 
 
 PAYLOAD_INDEX_FIELDS = [
@@ -2156,8 +2149,8 @@ def _render_chat_view() -> None:
     - 主區左：聊天歷史 + chat input
     - 主區右：最近一輪 retrieved chunks 的源頁圖片
     """
-    if not HAS_OLLAMA:
-        st.error("`ollama` 套件或 `llm_chat.py` 未載入：`pip install ollama`")
+    if not HAS_LLM:
+        st.error("`openai` 套件或 `llm_chat.py` 未載入：`pip install openai`")
         st.stop()
 
     # ---- 左 sidebar ----
@@ -2242,29 +2235,34 @@ def _render_chat_view() -> None:
         # === 對話設定 ===
         st.subheader("💬 對話設定")
 
-        # Ollama
-        sb_ollama_url = st.text_input(
-            "Ollama URL",
-            value=st.session_state.get("_chat_ollama_url", OLLAMA_DEFAULT_URL),
-            key="_chat_ollama_url",
+        # vLLM（OpenAI 相容）服務位址：base_url 需含 /v1
+        sb_llm_url = st.text_input(
+            "vLLM URL (OpenAI 相容，含 /v1)",
+            value=st.session_state.get("_chat_llm_url", LLM_BASE_URL),
+            key="_chat_llm_url",
         )
-        # 動態抓遠端主機模型清單（/api/tags）；抓不到（host 不通）退回 .env 內建清單
-        _remote_models = list_ollama_models(sb_ollama_url)
-        sb_model_options = _remote_models or list(OLLAMA_MODEL_CHOICES)
-        sb_current = st.session_state.get("_chat_model", OLLAMA_DEFAULT_MODEL)
-        if sb_current not in sb_model_options:
+        # 動態抓服務的模型清單（GET /v1/models）；抓不到（服務不通）退回 .env 內建清單
+        _remote_models = list_llm_models(sb_llm_url)
+        sb_model_options = _remote_models or list(LLM_MODEL_CHOICES)
+        # vLLM 通常只服務一個模型 → 有抓到遠端清單就以它為預設（.env 的 tag 多半對不上 vLLM id）
+        _default_model = _remote_models[0] if _remote_models else (LLM_DEFAULT_MODEL or "")
+        sb_current = st.session_state.get("_chat_model", _default_model)
+        if sb_current and sb_current not in sb_model_options:
             sb_model_options.insert(0, sb_current)
+        if not sb_model_options:
+            sb_model_options = [""]  # 避免空 options 讓 selectbox 崩
+        _sel_idx = sb_model_options.index(sb_current) if sb_current in sb_model_options else 0
         sb_model = st.selectbox(
-            "Ollama Model", options=sb_model_options,
-            index=sb_model_options.index(sb_current),
+            "Model", options=sb_model_options,
+            index=_sel_idx,
             key="_chat_model",
-            help="清單動態抓自遠端 Ollama（/api/tags）；抓不到時退回 .env 內建。"
-                 "若清單無想要的 tag，在 Custom 自填",
+            help="清單動態抓自 vLLM（/v1/models）；抓不到時退回 .env 內建。"
+                 "vLLM 通常只服務一個模型；若清單無想要的，在 Custom 自填",
         )
         if not _remote_models:
-            st.caption("（未連上遠端 Ollama 或無模型 → 顯示 .env 內建清單）")
+            st.caption("（未連上 vLLM 或無模型 → 顯示 .env 內建清單）")
         else:
-            st.caption(f"🟢 遠端 {len(_remote_models)} 個模型可用")
+            st.caption(f"🟢 vLLM {len(_remote_models)} 個模型可用")
         sb_custom = st.text_input(
             "Custom model tag（覆寫上方）", value="",
             key="_chat_model_custom",
@@ -2313,14 +2311,13 @@ def _render_chat_view() -> None:
                 step=0.05, key="_chat_top_p",
             )
             sb_num_predict = st.number_input(
-                "num_predict (max output tokens)", min_value=128, max_value=16384,
+                "max_tokens (max output tokens)", min_value=128, max_value=16384,
                 value=st.session_state.get("_chat_num_predict", LLM_DEFAULT_NUM_PREDICT),
                 step=128, key="_chat_num_predict",
             )
-            sb_num_ctx = st.number_input(
-                "num_ctx (context window)", min_value=2048, max_value=131072,
-                value=st.session_state.get("_chat_num_ctx", LLM_DEFAULT_NUM_CTX),
-                step=2048, key="_chat_num_ctx",
+            st.caption(
+                "ℹ️ context 長度（num_ctx）由 vLLM 服務端 `--max-model-len` 決定，"
+                "非 per-request 參數，故此處不再提供。"
             )
 
         # 連線設定（Qdrant + 原始檔路徑）
@@ -2540,14 +2537,14 @@ def _render_chat_view() -> None:
             except Exception as e:
                 _chat_fail(active_sess, f"⚠️ Embedder 載入失敗：\n```\n{e}\n```")
 
-            ollama_cli = get_ollama_client(sb_ollama_url)
+            llm_cli = get_llm_client(sb_llm_url)
 
             # 2. HyDE 改寫（可選；LLM 關閉時不做，避免任何 LLM 呼叫）
             embed_query_text = q
             if sb_hyde and sb_llm_on:
                 try:
                     with st.spinner("HyDE 改寫中..."):
-                        embed_query_text = llm_generate_hyde(ollama_cli, active_model, q)
+                        embed_query_text = llm_generate_hyde(llm_cli, active_model, q)
                 except Exception as e:
                     st.warning(f"HyDE 失敗，fallback 用原 query：{e}")
                     embed_query_text = q
@@ -2580,7 +2577,7 @@ def _render_chat_view() -> None:
                 _chat_fail(active_sess, f"⚠️ 檢索失敗：\n```\n{e}\n```")
             rag_chunks = [{"score": h.score, "payload": h.payload or {}} for h in hits]
         else:
-            ollama_cli = get_ollama_client(sb_ollama_url)
+            llm_cli = get_llm_client(sb_llm_url)
 
         if sb_llm_on:
             # 4. 組 messages
@@ -2608,18 +2605,17 @@ def _render_chat_view() -> None:
             try:
                 with live_turn:
                     with st.chat_message("assistant"):
-                        stream = ollama_cli.chat(
+                        # vLLM（OpenAI 相容）：num_ctx 不是 per-request 參數（context 長度由
+                        # 服務端 --max-model-len 決定），故不傳；num_predict → max_tokens。
+                        stream = llm_cli.chat.completions.create(
                             model=active_model,
                             messages=messages,
-                            options={
-                                "num_ctx": int(sb_num_ctx),
-                                "temperature": float(sb_temp),
-                                "top_p": float(sb_top_p),
-                                "num_predict": int(sb_num_predict),
-                            },
+                            temperature=float(sb_temp),
+                            top_p=float(sb_top_p),
+                            max_tokens=int(sb_num_predict),
                             stream=True,
                         )
-                        answer = st.write_stream(_ollama_stream_tokens(stream))
+                        answer = st.write_stream(_llm_stream_tokens(stream))
             except Exception as e:
                 _chat_fail(active_sess, f"⚠️ LLM 呼叫失敗：`{e}`", chunks=rag_chunks)
 
@@ -2651,7 +2647,7 @@ def _render_chat_view() -> None:
             if sb_llm_on and llm_generate_title is not None:
                 try:
                     with st.spinner("產生對話標題中..."):
-                        title = llm_generate_title(ollama_cli, active_model, first_user)
+                        title = llm_generate_title(llm_cli, active_model, first_user)
                 except Exception:
                     title = ""  # LLM 失敗 → 用 fallback
             active_sess["title"] = title or fallback_title
