@@ -3002,7 +3002,10 @@ with st.sidebar:
             key="_review_doc_type_folder",
             help="完整路徑 = 原始資料根目錄 / 此資料夾。只處理此資料夾底下、且實體存在的檔。",
         )
-        st.caption(f"📂 作用目錄：`{data_path / selected_doc_type}`")
+        st.caption(
+            f"📂 作用文件種類（相對）：`{selected_doc_type}/…` "
+            f"· 比對只看 file_key 首段，與絕對根無關 · 絕對根僅供 PDF 預覽拼路徑"
+        )
 
     image_root_str = st.text_input(
         "圖片根目錄", str(MKDATA_PATH),
@@ -3028,21 +3031,20 @@ with st.sidebar:
     file_keys = sorted(tracker.keys())
 
     # 依選定的 DATA_DOC_TYPE 過濾：只留「file_key 首段 == 此資料夾 且 DATA_ROOT/file_key 實體存在」的。
-    # 對應不到目錄底下的（首段不符 或 檔不存在）不載入清單 → 連帶 fast pipeline 也碰不到。
-    # 優雅退場：若完全找不到符合的（多半是 tracker 尚未以 DATA_ROOT 重切、file_key 首段仍是建案），
-    # 則「不過濾、不中斷、先顯示全部 + 提示」，避免整個清單消失。
+    # 只比對「相對路徑」——file_key 首段 == 選定文件種類即可，不綁絕對根是否存在/可存取
+    # （絕對根 D:/璞真RAG資料夾 或 ./RAG_raw_data 都不影響比對；它只在 PDF 預覽時拼實體路徑用）。
+    # 優雅退場：完全比不到（tracker 尚未以此結構重切、首段仍是建案）→ 不過濾、不中斷、顯示全部 + 提示。
     if selected_doc_type:
         _matched = [
             fk for fk in file_keys
             if split_key_parts(fk)[:1] == [selected_doc_type]
-            and (data_path / fk).exists()
         ]
         if _matched:
             file_keys = _matched
         else:
             st.caption(
-                f"ℹ️ 找不到首段為「{selected_doc_type}」且存在於 `{data_path}` 底下的檔；"
-                "資料尚未以 DATA_ROOT 重切（file_key 首段仍是建案）→ 文件種類過濾暫不套用，先顯示全部。"
+                f"ℹ️ tracker 內找不到首段為「{selected_doc_type}」的 file_key"
+                "（資料尚未以此結構重切）→ 文件種類過濾暫不套用，先顯示全部。"
             )
 
     # 每個檔案的 review_status（從 sidecar 直接讀 disk）
