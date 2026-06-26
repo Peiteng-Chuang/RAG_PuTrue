@@ -300,6 +300,24 @@ def load_tracker():
         return json.load(f)
 
 
+@st.cache_data(show_spinner=False, ttl=30)
+def list_processed_files_in_dir(doc_dir_str: str, data_root_str: str, mkdata_str: str) -> list[str]:
+    """掃實體目錄 doc_dir 下的 PDF/PPT/PPTX，只回「mkdata 已有對應 {stem}.md（已處理）」的檔。
+
+    回傳 file_key = 相對 data_root 的路徑（= 文件種類/建案/檔，與 rebuild_tracker/v5 一致）。
+    以「實體目錄」為清單來源 → 每個實體檔只出現一次，天然去重，不受 tracker 殘留/重複 key 影響。
+    set() 再排序去重。cache 30s 避免每次 rerun 重掃整個目錄樹。
+    """
+    doc_dir, data_root, mkdata = Path(doc_dir_str), Path(data_root_str), Path(mkdata_str)
+    out: list[str] = []
+    if doc_dir.exists():
+        for ext in ("*.pdf", "*.ppt", "*.pptx"):
+            for p in doc_dir.rglob(ext):
+                if p.is_file() and (mkdata / f"{p.stem}.md").exists():
+                    out.append(str(p.relative_to(data_root)))
+    return sorted(set(out))
+
+
 def split_key_parts(file_key: str) -> list[str]:
     return [p for p in re.split(r"[\\/]+", file_key) if p]
 
@@ -3030,22 +3048,24 @@ with st.sidebar:
     tracker = load_tracker()
     file_keys = sorted(tracker.keys())
 
-    # 依選定的 DATA_DOC_TYPE 過濾：只留「file_key 首段 == 此資料夾 且 DATA_ROOT/file_key 實體存在」的。
-    # 只比對「相對路徑」——file_key 首段 == 選定文件種類即可，不綁絕對根是否存在/可存取
-    # （絕對根 D:/璞真RAG資料夾 或 ./RAG_raw_data 都不影響比對；它只在 PDF 預覽時拼實體路徑用）。
-    # 優雅退場：完全比不到（tracker 尚未以此結構重切、首段仍是建案）→ 不過濾、不中斷、顯示全部 + 提示。
+    # 清單來源：直接掃「原始資料根目錄 / <選定文件種類>」實體目錄，只留 mkdata 已處理（有 {stem}.md）的檔。
+    # 以實體檔為準 → 每檔只出現一次，避免 tracker 殘留 / 跨資料夾重複 key 造成清單重複。
+    # file_key = 相對原始資料根目錄的路徑（文件種類/建案/檔）；絕對根（D: 或 ./RAG_raw_data）只在此拼實體路徑用。
     if selected_doc_type:
-        _matched = [
-            fk for fk in file_keys
-            if split_key_parts(fk)[:1] == [selected_doc_type]
-        ]
-        if _matched:
-            file_keys = _matched
-        else:
+        file_keys = list_processed_files_in_dir(
+            str(data_path / selected_doc_type), str(data_path), str(MKDATA_PATH),
+        )
+        if not file_keys:
             st.caption(
-                f"ℹ️ tracker 內找不到首段為「{selected_doc_type}」的 file_key"
-                "（資料尚未以此結構重切）→ 文件種類過濾暫不套用，先顯示全部。"
+                f"ℹ️ 「{selected_doc_type}」目錄底下找不到已處理（mkdata 有 .md）的檔。"
+                f"確認原始資料根目錄（{data_path}）可存取、且該類別已產生 .md。"
             )
+
+    # 清單為空（disk-scan 無結果 / tracker 空）→ 停在這，避免 selectbox 回 None 後續崩。
+    # 上方「原始資料根目錄」「文件種類」下拉已渲染、仍可調整 → rerun 後可恢復。
+    if not file_keys:
+        st.warning("目前清單為空（無檔可審閱）。請調整上方原始資料根目錄／文件種類，或先產生 .md。")
+        st.stop()
 
     # 每個檔案的 review_status（從 sidecar 直接讀 disk）
     _file_status_map: dict[str, str] = {
