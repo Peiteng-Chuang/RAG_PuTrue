@@ -25,8 +25,9 @@ class LibreOfficeConverter(FormatConverter):
 
     SUPPORTED_EXTS = {".ppt", ".pptx"}
 
-    def __init__(self, soffice_path: str | None = None):
+    def __init__(self, soffice_path: str | None = None, timeout: int = 180):
         self._soffice = soffice_path or self._find_soffice()
+        self._timeout = timeout
 
     @staticmethod
     def _find_soffice() -> str:
@@ -39,9 +40,21 @@ class LibreOfficeConverter(FormatConverter):
         return ext.lower() in self.SUPPORTED_EXTS
 
     def convert(self, src: Path, tmp_dir: Path) -> Path:
-        subprocess.run(
-            [self._soffice, "--headless", "--convert-to", "pdf",
-             "--outdir", str(tmp_dir), str(src)],
-            check=True, capture_output=True,
-        )
+        # 每檔獨立的 UserInstallation profile，避免 (1) 殘留 lock 卡住 headless 轉檔、
+        # (2) 多 worker 並行時共用預設 profile 互相鎖死。
+        profile_dir = (tmp_dir / f"_lo_profile_{src.stem}").absolute()
+        profile_uri = profile_dir.as_uri()
+        try:
+            subprocess.run(
+                [self._soffice, "--headless",
+                 f"-env:UserInstallation={profile_uri}",
+                 "--convert-to", "pdf",
+                 "--outdir", str(tmp_dir), str(src)],
+                check=True, capture_output=True, timeout=self._timeout,
+            )
+        except subprocess.TimeoutExpired as e:
+            # 不讓 LibreOffice hang 卡死整檔；轉成可被 pipeline 捕捉的錯誤
+            raise RuntimeError(
+                f"LibreOffice 轉檔逾時（>{self._timeout}s）：{src.name}"
+            ) from e
         return tmp_dir / f"{src.stem}.pdf"

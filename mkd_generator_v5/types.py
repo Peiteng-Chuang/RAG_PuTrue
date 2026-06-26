@@ -134,6 +134,7 @@ class FileStats:
     slow_pages: int = 0
     bad_xref_count: int = 0          # template scan 偵測到的 bad xref 張數
     triage_fallback_count: int = 0    # triage.route 失敗 fallback fast 的頁數
+    marker_unresolved_pages: int = 0  # Marker 未解析、填註記的頁數（避免 placeholder 洩漏）
     warning_count: int = 0            # 本檔累積 warning 總數
 
     def summary_line(self) -> str:
@@ -146,6 +147,8 @@ class FileStats:
             parts.append(f"bad_xref={self.bad_xref_count}")
         if self.triage_fallback_count:
             parts.append(f"triage_fallback={self.triage_fallback_count}")
+        if self.marker_unresolved_pages:
+            parts.append(f"marker_unresolved={self.marker_unresolved_pages}")
         if self.warning_count:
             parts.append(f"warnings={self.warning_count}")
         return " · ".join(parts)

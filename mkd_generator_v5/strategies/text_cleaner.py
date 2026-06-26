@@ -32,6 +32,33 @@ class TextCleaner(ABC):
         ]
 
 
+_PAGE_NUM_PATTERNS = [
+    re.compile(r"^\d{1,4}$"),                       # 3
+    re.compile(r"^\d{1,4}[/／]\d{1,4}$"),           # 3/52
+    re.compile(r"^第?\d{1,4}[頁页]$"),              # 第3頁 / 3頁
+    re.compile(r"^[-–—]\d{1,4}[-–—]$"),            # - 3 -
+    re.compile(r"^[Pp](?:age)?\.?\d{1,4}$"),       # P3 / Page3 / P.3
+]
+
+
+def _is_page_number_noise(
+    text: str, y0: float, y1: float, page_h: float, margin_ratio: float = 0.08,
+) -> bool:
+    """頁碼/頁尾雜訊判定：**位於上/下邊界帶** 且 **符合頁碼樣式**（雙條件才剃）。
+
+    PPT→PDF 後頁碼/頁尾是每頁變動的文字（1、2、3…／3/52），模板過濾靠「內容相同」
+    比對抓不到。這裡改用「位置（邊界帶）+ 樣式」抓——正文不會只是『3』又落在頁尾，
+    雙條件可避免誤刪。"""
+    s = text.strip()
+    if not s or len(s) > 16:
+        return False
+    in_band = (y1 <= page_h * margin_ratio) or (y0 >= page_h * (1 - margin_ratio))
+    if not in_band:
+        return False
+    compact = re.sub(r"\s+", "", s)
+    return any(p.match(compact) for p in _PAGE_NUM_PATTERNS)
+
+
 def _bbox_contains(
     outer: tuple[float, float, float, float],
     inner: tuple[float, float, float, float] | None,
@@ -155,10 +182,14 @@ class SpanLevelTextCleaner(TextCleaner):
         position_tolerance: float = 0.1,
         dedup_tolerance_pt: float = 5.0,  # 從 B-strict 的 3 放寬到 5（span 重組後位置可能微移）
         bbox_tolerance_pt: float = 1.0,
+        strip_page_numbers: bool = True,   # 剃除頁尾/頁首的頁碼類雜訊
+        page_number_margin_ratio: float = 0.08,
     ):
         self.position_tolerance = position_tolerance
         self.dedup_tolerance_pt = dedup_tolerance_pt
         self.bbox_tolerance_pt = bbox_tolerance_pt
+        self.strip_page_numbers = strip_page_numbers
+        self.page_number_margin_ratio = page_number_margin_ratio
 
     def _collect_title_bboxes(self, title: TitleHit | None) -> list[tuple]:
         """彙整 page_title + subtitle + inline_headings 全部要 skip 的 bbox。"""
@@ -282,6 +313,12 @@ class SpanLevelTextCleaner(TextCleaner):
 
             # 3. 標題殘留排除（剝完 title span 後內容若剛好 == title，少數邊界情境）
             if norm_title and norm_text == norm_title:
+                continue
+
+            # 4. 頁碼/頁尾雜訊剃除（邊界帶 + 頁碼樣式雙條件）
+            if self.strip_page_numbers and _is_page_number_noise(
+                block_text, y0, y1, page_h, self.page_number_margin_ratio,
+            ):
                 continue
 
             results.append((y0, block_text))

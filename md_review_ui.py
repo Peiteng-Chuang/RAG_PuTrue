@@ -87,6 +87,11 @@ except Exception:  # noqa: BLE001 — 缺元件時退回純記憶體（session_s
 
 # === 路徑設定 ===
 DEFAULT_DATA_PATH = r"D:/璞真RAG資料夾/12.個案銷講資料"
+# .env：DATA_ROOT = 原始資料根目錄（= file_key 相對基底）；DATA_DOC_TYPE = 其下的文件種類
+# 資料夾（逗號分隔）。完整路徑 = DATA_ROOT / <選定的 DATA_DOC_TYPE> / …。審閱模式用下拉選
+# DATA_DOC_TYPE，清單與 fast pipeline 只含「該資料夾底下、且實體存在」的檔。
+DATA_ROOT_ENV = (os.getenv("DATA_ROOT", "") or "").strip()
+DATA_DOC_TYPES = [s.strip() for s in (os.getenv("DATA_DOC_TYPE", "") or "").split(",") if s.strip()]
 MKDATA_PATH = Path("./mkdata")
 TRACKER = MKDATA_PATH / "process_tracker.json"
 CHAT_LS_KEY = "putrue_chat_sessions"  # 對話紀錄存放於瀏覽器 localStorage 的 item key（取代舊的 server 磁碟檔）
@@ -1470,16 +1475,28 @@ def get_collection_total(client, name: str) -> int:
 
 
 @st.cache_data(show_spinner=False, ttl=300)
-def list_facet_values(url: str, api_key: str, coll: str, field: str) -> list[str]:
-    """用 Qdrant facet API 列出某 keyword 欄位的所有 distinct 值（給篩選下拉用）。
+def list_facet_values(
+    url: str, api_key: str, coll: str, field: str,
+    filter_field: str | None = None,
+    filter_values: tuple[str, ...] | None = None,
+) -> list[str]:
+    """用 Qdrant facet API 列出某 keyword 欄位的 distinct 值（給篩選下拉用）。
 
+    filter_field/filter_values（皆 hashable，供 cache key）：對 facet 加條件——只統計
+    `filter_field IN filter_values` 的 points。用來做「連動下拉」（例如只列某文件種類底下
+    實際存在的專案），避免使用者選出不存在的組合。
     連線／查詢失敗回空 list，讓 UI 退回「不篩」、不報錯。cache 5 分鐘避免每 rerun 打 Qdrant。
     """
     try:
         cli = get_qdrant_client(url, api_key)
         if not cli.collection_exists(coll):
             return []
-        resp = cli.facet(collection_name=coll, key=field, limit=1000)
+        ffilter = None
+        if filter_field and filter_values:
+            ffilter = qm.Filter(must=[qm.FieldCondition(
+                key=filter_field, match=qm.MatchAny(any=list(filter_values)),
+            )])
+        resp = cli.facet(collection_name=coll, key=field, facet_filter=ffilter, limit=1000)
         return sorted(
             h.value for h in resp.hits
             if isinstance(getattr(h, "value", None), str) and h.value
@@ -1488,10 +1505,18 @@ def list_facet_values(url: str, api_key: str, coll: str, field: str) -> list[str
         return []
 
 
-def list_projects_in_collection(url: str, api_key: str, coll: str) -> list[str]:
-    """distinct 建案名（metadata.source.project_name）。對話模式取不到審閱模式的 file_keys，
-    改從實際 ingest 進去的資料反查更準。"""
-    return list_facet_values(url, api_key, coll, "metadata.source.project_name")
+def list_projects_in_collection(
+    url: str, api_key: str, coll: str, doc_types: list[str] | None = None,
+) -> list[str]:
+    """distinct 建案名（metadata.source.project_name）。
+
+    傳 doc_types → 只列「這些文件種類底下實際存在」的建案（連動下拉，防止選出空組合）。
+    對話模式取不到審閱模式的 file_keys，改從實際 ingest 進去的資料反查更準。"""
+    return list_facet_values(
+        url, api_key, coll, "metadata.source.project_name",
+        filter_field="metadata.source.doc_type" if doc_types else None,
+        filter_values=tuple(sorted(doc_types)) if doc_types else None,
+    )
 
 
 def list_doc_types_in_collection(url: str, api_key: str, coll: str) -> list[str]:
@@ -2404,23 +2429,38 @@ def _render_chat_view() -> None:
             _qurl = st.session_state.get("_chat_qdrant_url", QDRANT_DEFAULT_URL)
             _qkey = st.session_state.get("_chat_qdrant_key", "")
             _qcoll = st.session_state.get("_chat_qdrant_coll", QDRANT_TEXT_COLLECTION)
-            _proj_opts = list_projects_in_collection(_qurl, _qkey, _qcoll)
             _dt_opts = list_doc_types_in_collection(_qurl, _qkey, _qcoll)
-            # 兩個下拉同欄堆疊（不再左右分欄，避免擠成窄方塊）
-            sb_projects = st.multiselect(
-                "🏗 指定專案（留空＝全部）",
-                options=_proj_opts, default=[],
-                key="_chat_filter_projects",
-                help="留空＝搜整個 collection；勾選後只在這些建案內檢索（多選 OR）。",
+            # 顯示順序：指定專案（上）→ 文件種類（下）。連動仍以「文件種類」為父：
+            # 先從 session_state 讀文件種類的當前選擇來篩專案選項——即使文件種類渲染在下方
+            # 也成立（widget 變動會在 rerun 前寫回 session_state，下個 run 即反映）。
+            _sel_dt = st.session_state.get("_chat_filter_doc_types", [])
+            # 專案連動：只列「所選文件種類底下」的專案，杜絕選出不存在的（類別✕專案）空組合 → 查無結果
+            _proj_opts = list_projects_in_collection(
+                _qurl, _qkey, _qcoll, doc_types=_sel_dt or None,
             )
+            # 防呆：類別變動使某些已選專案失效時，先剃掉再渲染（避免殘留無效值 → AND 後空交集）
+            _cur_proj = st.session_state.get("_chat_filter_projects", [])
+            _valid_proj = [p for p in _cur_proj if p in _proj_opts]
+            if _valid_proj != _cur_proj:
+                st.session_state["_chat_filter_projects"] = _valid_proj
+            # 指定專案（上）
+            sb_projects = st.multiselect(
+                "🏗 指定專案（留空＝該類別全部）",
+                options=_proj_opts,
+                key="_chat_filter_projects",
+                help="只列出下方所選文件種類底下的專案；未選文件種類時列全部（多選 OR）。",
+            )
+            # 文件種類（下）
             sb_doc_types = st.multiselect(
                 "📁 文件種類（留空＝全部）",
                 options=_dt_opts, default=[],
                 key="_chat_filter_doc_types",
-                help="依 metadata.source.doc_type 篩文件種類，例如只搜法規規範（多選 OR）。",
+                help="選文件種類會連動上方專案清單，只列該類別底下實際存在的專案（多選 OR）。",
             )
-            if not _proj_opts and not _dt_opts:
+            if not _dt_opts and not _proj_opts:
                 st.caption("（未取得清單：Qdrant 未連線或 collection 為空 → 將不套用篩選）")
+            elif _sel_dt and not _proj_opts:
+                st.caption("（所選文件種類底下查無專案——可能該類別尚未 ingest）")
         else:
             st.caption("🔗 RAG 已關閉（純 LLM 對話）—— 開啟後可在此指定專案／文件種類")
 
@@ -2947,10 +2987,22 @@ def _render_fast_pipeline(
 with st.sidebar:
     st.header("設定")
     data_path_str = st.text_input(
-        "原始資料根目錄", DEFAULT_DATA_PATH,
-        help="process_tracker 內 file_key 的相對基底（PDF/PPT 來源）"
+        "原始資料根目錄（DATA_ROOT）", DATA_ROOT_ENV or DEFAULT_DATA_PATH,
+        help="file_key 的相對基底；預設讀 .env 的 DATA_ROOT。完整路徑 = 此根 / 文件種類資料夾 / …"
     )
     data_path = Path(data_path_str)
+
+    # .env DATA_DOC_TYPE 下拉：選文件種類資料夾 → 清單與 fast pipeline 只含「DATA_ROOT/<此資料夾>」
+    # 底下、且實體存在的檔（file_key 首段 == 此資料夾）。對應不到目錄的檔不載入。
+    selected_doc_type = ""
+    if DATA_DOC_TYPES:
+        selected_doc_type = st.selectbox(
+            "文件種類資料夾（DATA_DOC_TYPE）",
+            options=DATA_DOC_TYPES,
+            key="_review_doc_type_folder",
+            help="完整路徑 = 原始資料根目錄 / 此資料夾。只處理此資料夾底下、且實體存在的檔。",
+        )
+        st.caption(f"📂 作用目錄：`{data_path / selected_doc_type}`")
 
     image_root_str = st.text_input(
         "圖片根目錄", str(MKDATA_PATH),
@@ -2974,6 +3026,21 @@ with st.sidebar:
         st.stop()
     tracker = load_tracker()
     file_keys = sorted(tracker.keys())
+
+    # 依選定的 DATA_DOC_TYPE 過濾：只留「file_key 首段 == 此資料夾 且 DATA_ROOT/file_key 實體存在」的。
+    # 對應不到目錄底下的（首段不符 或 檔不存在）一律不載入清單 → 連帶 fast pipeline 也碰不到。
+    if selected_doc_type:
+        file_keys = [
+            fk for fk in file_keys
+            if split_key_parts(fk)[:1] == [selected_doc_type]
+            and (data_path / fk).exists()
+        ]
+        if not file_keys:
+            st.warning(
+                f"文件種類資料夾「{selected_doc_type}」底下無對應實體檔。請確認原始資料根目錄"
+                f"（{data_path}）可存取，且已用該根目錄為 data_root 重新 ingest（file_key 首段需為文件種類）。"
+            )
+            st.stop()
 
     # 每個檔案的 review_status（從 sidecar 直接讀 disk）
     _file_status_map: dict[str, str] = {

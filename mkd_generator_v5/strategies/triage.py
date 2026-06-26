@@ -19,16 +19,49 @@ class TriageStrategy(ABC):
 
 
 class DrawingCountTriage(TriageStrategy):
-    """v4 等價：page.get_drawings() 數量超閾值 → slow（CAD 結構符號頁吃 Marker）。
+    """v4 等價 + 掃描頁偵測：
+    - page.get_drawings() 數量超閾值 → slow（CAD 結構符號頁吃 Marker）。
+    - 偵測到「掃描/圖片型頁」（幾乎無可抽文字 + 大圖蓋滿頁）→ slow，送 Marker OCR。
+      否則這類頁走 fast 會抽不到字 → 空白/亂碼且永不 OCR。
 
     閾值 200 來自 [[triage-threshold-rationale]]：CAD 符號每個就上百向量。
     """
 
-    def __init__(self, threshold: int = 200):
+    def __init__(
+        self,
+        threshold: int = 200,
+        detect_scanned: bool = True,
+        scanned_text_max_chars: int = 20,   # 可抽文字少於此 → 視為「幾乎無文字」
+        scanned_img_cover: float = 0.6,     # 單張圖覆蓋頁面比例超此 → 視為掃描頁
+    ):
         self.threshold = threshold
+        self.detect_scanned = detect_scanned
+        self.scanned_text_max_chars = scanned_text_max_chars
+        self.scanned_img_cover = scanned_img_cover
+
+    def _looks_scanned(self, page) -> bool:
+        """幾乎無可抽文字 + 有大圖幾乎蓋滿頁 → 掃描/圖片型，需 OCR。"""
+        if not self.detect_scanned:
+            return False
+        try:
+            if len((page.get_text("text") or "").strip()) >= self.scanned_text_max_chars:
+                return False  # 有實質文字 → 不是掃描頁，省下 image 檢查
+            page_area = max(1.0, page.rect.width * page.rect.height)
+            for info in page.get_image_info(xrefs=False):
+                x0, y0, x1, y1 = info["bbox"]
+                if (x1 - x0) * (y1 - y0) >= page_area * self.scanned_img_cover:
+                    return True
+        except Exception:
+            return False
+        return False
 
     def route(self, page):
-        return "slow" if len(page.get_drawings()) > self.threshold else "fast"
+        try:
+            if len(page.get_drawings()) > self.threshold:
+                return "slow"
+        except Exception:
+            pass
+        return "slow" if self._looks_scanned(page) else "fast"
 
     def explain(self, page) -> dict:
         try:
@@ -36,6 +69,7 @@ class DrawingCountTriage(TriageStrategy):
         except Exception:
             n = -1
         return {"drawings": n, "threshold": self.threshold,
+                "scanned": self._looks_scanned(page),
                 "strategy": "DrawingCountTriage"}
 
 

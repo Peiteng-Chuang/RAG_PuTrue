@@ -260,6 +260,24 @@ class RAGPipeline:
                         doc, working_pdf, vector_indices, fragments, ctx,
                     )
 
+            # 清理未替換的 Marker placeholder：Marker 失敗/回空/無 converter 時，
+            # [[MARKER_REPLACE_P*]] 會原樣殘留並洩漏進 .md / Qdrant。一律換成可見註記，
+            # 杜絕字面 placeholder 變成「內容」。
+            _unresolved = 0
+            for frag in fragments:
+                if (frag.is_marker_page and frag.marker_placeholder
+                        and frag.marker_placeholder in frag.body):
+                    frag.body = frag.body.replace(
+                        frag.marker_placeholder,
+                        "> （本頁為圖面／掃描頁，未能自動解析文字）\n",
+                    )
+                    _unresolved += 1
+            if _unresolved:
+                stats.marker_unresolved_pages = _unresolved
+                self.reporter.warning(
+                    f"{_unresolved} 頁 Marker 未解析 → 已填註記（非 placeholder 洩漏）"
+                )
+
             # S1: 寫 triage decision log（在 stitch 前，避免影響 ETL 成功與否）
             if self.enable_triage_log and triage_log:
                 try:
