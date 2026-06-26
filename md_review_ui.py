@@ -3028,19 +3028,22 @@ with st.sidebar:
     file_keys = sorted(tracker.keys())
 
     # 依選定的 DATA_DOC_TYPE 過濾：只留「file_key 首段 == 此資料夾 且 DATA_ROOT/file_key 實體存在」的。
-    # 對應不到目錄底下的（首段不符 或 檔不存在）一律不載入清單 → 連帶 fast pipeline 也碰不到。
+    # 對應不到目錄底下的（首段不符 或 檔不存在）不載入清單 → 連帶 fast pipeline 也碰不到。
+    # 優雅退場：若完全找不到符合的（多半是 tracker 尚未以 DATA_ROOT 重切、file_key 首段仍是建案），
+    # 則「不過濾、不中斷、先顯示全部 + 提示」，避免整個清單消失。
     if selected_doc_type:
-        file_keys = [
+        _matched = [
             fk for fk in file_keys
             if split_key_parts(fk)[:1] == [selected_doc_type]
             and (data_path / fk).exists()
         ]
-        if not file_keys:
-            st.warning(
-                f"文件種類資料夾「{selected_doc_type}」底下無對應實體檔。請確認原始資料根目錄"
-                f"（{data_path}）可存取，且已用該根目錄為 data_root 重新 ingest（file_key 首段需為文件種類）。"
+        if _matched:
+            file_keys = _matched
+        else:
+            st.caption(
+                f"ℹ️ 找不到首段為「{selected_doc_type}」且存在於 `{data_path}` 底下的檔；"
+                "資料尚未以 DATA_ROOT 重切（file_key 首段仍是建案）→ 文件種類過濾暫不套用，先顯示全部。"
             )
-            st.stop()
 
     # 每個檔案的 review_status（從 sidecar 直接讀 disk）
     _file_status_map: dict[str, str] = {
