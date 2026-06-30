@@ -2777,6 +2777,208 @@ if not st.session_state.get("review_unlocked", False):
 st.title("PDF ↔ Markdown 比對 + Chunk Preview")
 
 
+def _pathfix_scan(
+    data_root: Path, scan_dir: Path,
+    url: str, api_key: str, collection: str, selected_doc_type: str,
+) -> dict:
+    """掃描磁碟現況 vs Qdrant payload，用 file_hash（內容 md5）配對，找出「改了路徑名」的檔。
+
+    為何用 file_hash：改資料夾名後 stem/相對路徑都可能對不上，唯有內容雜湊是穩定身分 →
+    對改名免疫、也繞過 stem 撞號。掃描限縮在選定的文件種類資料夾，避免整樹重算 md5。
+    回 dict：diffs（待修）/ n_same（一致）/ not_in_db（磁碟有 DB 沒有，需跑 v5）/
+    db_orphan（DB 有但磁碟內容找不到）/ 計數。純讀取，不寫任何資料。
+    """
+    if not scan_dir.exists():
+        return {"error": f"掃描目錄不存在：{scan_dir}"}
+    # 1) 掃磁碟（限縮 scan_dir）→ {file_hash: 新 file_key}
+    disk_by_hash: dict[str, str] = {}
+    disk_collision: set[str] = set()
+    for ext in ("*.pdf", "*.ppt", "*.pptx"):
+        for p in scan_dir.rglob(ext):
+            if not p.is_file():
+                continue
+            h = compute_file_hash(p)
+            if not h:
+                continue
+            new_fk = str(p.relative_to(data_root))
+            if h in disk_by_hash and disk_by_hash[h] != new_fk:
+                disk_collision.add(h)  # 同內容多檔（真重複），罕見
+            disk_by_hash[h] = new_fk
+    # 2) 掃 Qdrant：filter doc_type（用「解析後」的 doc_type，對齊 payload 實際值）→ 依 file_hash 分組
+    try:
+        cli = get_qdrant_client(url, api_key)
+        if not cli.collection_exists(collection):
+            return {"error": f"collection 不存在：{collection}"}
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"Qdrant 連線失敗：{e}"}
+    dtm = load_doc_type_map()
+    resolved_dt = str(dtm.get(selected_doc_type) or selected_doc_type)
+    flt = qm.Filter(must=[qm.FieldCondition(
+        key="metadata.source.doc_type", match=qm.MatchValue(value=resolved_dt),
+    )])
+    db_by_hash: dict[str, dict] = {}
+    nohash = 0
+    offset = None
+    try:
+        while True:
+            pts, offset = cli.scroll(
+                collection, scroll_filter=flt, limit=512, offset=offset,
+                with_payload=True, with_vectors=False,
+            )
+            for pt in pts:
+                src = ((pt.payload or {}).get("metadata") or {}).get("source") or {}
+                h = (src.get("file_hash") or "").strip()
+                if not h:
+                    nohash += 1
+                    continue
+                g = db_by_hash.setdefault(
+                    h, {"fk": src.get("file_key") or "", "ids": [], "src": src})
+                g["ids"].append(pt.id)
+            if offset is None:
+                break
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"Qdrant 掃描失敗：{e}"}
+    # 3) 比對（以磁碟內容雜湊為準）
+    diffs: list[dict] = []
+    n_same = 0
+    not_in_db: list[str] = []
+    for h, new_fk in disk_by_hash.items():
+        g = db_by_hash.get(h)
+        if g is None:
+            not_in_db.append(new_fk)  # 磁碟有、DB 沒有 → 未入庫或 stem 撞號被覆蓋
+            continue
+        if str(g["fk"]).replace("\\", "/") == new_fk.replace("\\", "/"):
+            n_same += 1
+            continue
+        src = g["src"]
+        diffs.append({
+            "old_fk": g["fk"], "new_fk": new_fk, "ids": g["ids"], "src": src,
+            "new_dt": resolve_doc_type(new_fk, src, dtm),
+            "new_pj": derive_project_name(new_fk),
+            "old_pj": src.get("project_name", "—"),
+        })
+    disk_hashes = set(disk_by_hash)
+    db_orphan = sorted(g["fk"] for hh, g in db_by_hash.items() if hh not in disk_hashes)
+    return {
+        "diffs": diffs, "n_same": n_same, "not_in_db": sorted(not_in_db),
+        "db_orphan": db_orphan, "n_disk": len(disk_by_hash), "n_db": len(db_by_hash),
+        "nohash": nohash, "collision": sorted(disk_collision), "resolved_dt": resolved_dt,
+    }
+
+
+def _pathfix_apply(url: str, api_key: str, collection: str, diffs: list[dict]) -> str:
+    """把 diffs 的新路徑寫回 payload：set_payload(key='metadata.source') 整檔覆蓋。
+    point_id 是內容雜湊衍生、未變 → 原地覆蓋、不動向量、不重 embed。[[feedback-data-dependency-audit-first]]"""
+    cli = get_qdrant_client(url, api_key)
+    done = fails = 0
+    errs: list[str] = []
+    for d in diffs:
+        new_src = dict(d["src"])
+        new_src.update(
+            file_key=d["new_fk"], file_path=d["new_fk"],
+            project_name=d["new_pj"], doc_type=d["new_dt"],
+        )
+        try:
+            cli.set_payload(collection, payload=new_src, points=d["ids"], key="metadata.source")
+            done += 1
+        except Exception as e:  # noqa: BLE001
+            fails += 1
+            errs.append(f"{d['new_fk']}: {e}")
+    msg = f"✅ 已修正 {done}/{len(diffs)} 檔的 file_key（原地覆蓋 payload，向量未動）。"
+    if fails:
+        msg += f"　⚠️ 失敗 {fails}：" + "；".join(errs[:5])
+    return msg
+
+
+def _render_path_correction(
+    data_root: Path, selected_doc_type: str,
+    qdrant_url: str, qdrant_api_key: str, collection: str,
+) -> None:
+    """🧭 路徑修正：改了資料夾名（如建案）後，把 Qdrant payload 的 file_key 同步成新路徑。
+
+    症狀：RAG 仍查得到（用存好的向量），但「📂 開啟原始檔」會『本機未找到』、指定專案下拉
+    少了新名——因為 payload 的 file_key/project_name 還是舊路徑。本區塊用檔案內容（file_hash）
+    比對磁碟與 payload，安全地原地改 file_key/file_path/project_name/doc_type，不重 embed。
+    """
+    st.divider()
+    st.subheader("🧭 路徑修正（改名後同步 file_key）")
+    # 修正報告（apply 後 rerun 才顯示）
+    _rep = st.session_state.pop("_pathfix_report", None)
+    if _rep:
+        (st.success if _rep.startswith("✅ 已修正") and "失敗" not in _rep else st.warning)(_rep)
+    st.caption(
+        "改了資料夾名後 RAG 仍查得到，但「📂 開啟原始檔」會『本機未找到』、指定專案下拉也少了"
+        "新名——因 payload 的 file_key 還是舊路徑。這裡用檔案內容（file_hash）比對，安全改成新路徑。"
+    )
+    if not HAS_QDRANT:
+        st.warning("qdrant-client 未安裝，無法修正。")
+        return
+    if not selected_doc_type:
+        st.info("請先在上方選一個「文件種類資料夾」；掃描會限縮在該資料夾底下（避免整樹重算 md5）。")
+        return
+
+    scan_dir = data_root / selected_doc_type
+    st.caption(f"掃描範圍：`{scan_dir}`　·　比對鍵＝檔案內容 md5（對改名免疫）")
+    _scan_key = f"_pathfix_scan::{collection}::{selected_doc_type}"
+
+    if st.button("🔍 掃描路徑差異", key=f"_pathfix_btn_{selected_doc_type}",
+                 use_container_width=True):
+        with st.spinner("掃描磁碟 + Qdrant，計算內容雜湊中…"):
+            st.session_state[_scan_key] = _pathfix_scan(
+                data_root, scan_dir, qdrant_url, qdrant_api_key, collection, selected_doc_type)
+
+    result = st.session_state.get(_scan_key)
+    if not result:
+        return
+    if result.get("error"):
+        st.error(result["error"])
+        return
+
+    diffs = result["diffs"]
+    st.markdown(
+        f"磁碟檔 **{result['n_disk']}**／DB 此類別（`{result['resolved_dt']}`）檔 **{result['n_db']}**"
+        f"　｜　✅ 一致 {result['n_same']}　🔧 待修 **{len(diffs)}**"
+        f"　🆕 未入庫 {len(result['not_in_db'])}　❓DB 無磁碟對應 {len(result['db_orphan'])}"
+    )
+    if result["collision"]:
+        st.warning(f"⚠️ 磁碟有 {len(result['collision'])} 組同內容多檔（真重複）→ 取最後掃到的路徑。")
+
+    if diffs:
+        with st.expander(f"🔧 待修正（{len(diffs)} 檔）", expanded=True):
+            for d in diffs[:200]:
+                st.markdown(
+                    f"- `{d['old_fk']}`　→　`{d['new_fk']}`"
+                    f"　（{len(d['ids'])} pts｜專案 `{d['old_pj']}`→`{d['new_pj']}`）")
+            if len(diffs) > 200:
+                st.caption(f"…另 {len(diffs) - 200} 檔（套用時全部處理）")
+    if result["not_in_db"]:
+        with st.expander(f"🆕 磁碟有、DB 沒有：{len(result['not_in_db'])}（未入庫或 stem 撞號被覆蓋 → 需跑 v5）"):
+            for fk in result["not_in_db"][:100]:
+                st.markdown(f"- `{fk}`")
+    if result["db_orphan"]:
+        with st.expander(f"❓ DB 有、磁碟內容找不到：{len(result['db_orphan'])}（檔已移走 / 改在別類別 / 撞號）"):
+            for fk in result["db_orphan"][:100]:
+                st.markdown(f"- `{fk}`")
+
+    if not diffs:
+        st.success("沒有需要修正的路徑差異 👍")
+        return
+
+    _confirm = st.checkbox(
+        f"我確認把上列 {len(diffs)} 檔的 file_key 改成新路徑（原地覆蓋 payload、不動向量）",
+        key=f"_pathfix_confirm_{selected_doc_type}")
+    if st.button("✅ 套用路徑修正", key=f"_pathfix_apply_{selected_doc_type}",
+                 disabled=not _confirm, use_container_width=True):
+        st.session_state["_pathfix_report"] = _pathfix_apply(
+            qdrant_url, qdrant_api_key, collection, diffs)
+        st.session_state.pop(_scan_key, None)  # 清掉舊掃描結果，逼下次重掃
+        try:
+            list_facet_values.clear()  # 清 facet cache，讓指定專案下拉立即反映新名
+        except Exception:  # noqa: BLE001
+            pass
+        st.rerun()
+
+
 def _render_fast_pipeline(
     file_keys, _file_status_map, image_root, data_path,
     qdrant_url, qdrant_api_key, qdrant_collection_name,
@@ -3154,6 +3356,11 @@ with st.sidebar:
         if _fp_lock_cols[1].button("🔒 鎖定", key="_fastpipe_lock_btn", use_container_width=True):
             st.session_state["_fastpipe_unlocked"] = False
             st.rerun()
+        # 🧭 路徑修正：放在 fast pipeline 之前（同一道密碼鎖內，因為也會寫 Qdrant）
+        _render_path_correction(
+            data_path, selected_doc_type,
+            qdrant_url, qdrant_api_key, qdrant_collection_name,
+        )
         _render_fast_pipeline(
             file_keys, _file_status_map, image_root, data_path,
             qdrant_url, qdrant_api_key, qdrant_collection_name,
