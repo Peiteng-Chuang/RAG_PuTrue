@@ -86,7 +86,10 @@ except Exception:  # noqa: BLE001 — 缺元件時退回純記憶體（session_s
 
 
 # === 路徑設定 ===
-DEFAULT_DATA_PATH = r"D:/璞真RAG資料夾/12.個案銷講資料"
+# ⚠️ DATA_ROOT（= file_key 相對基底），必須是「文件種類資料夾的父層」，不可含 doc_type 那層。
+# file_key = 類別/建案/檔（含類別），故開檔 data_root/file_key 才對得上；若這裡多包一層類別，
+# 12 會雙重巢狀、20 會被塞進 12 底下 → 開檔全部「本機未找到」（檢索不受影響）。
+DEFAULT_DATA_PATH = r"D:/璞真RAG資料夾"
 # .env：DATA_ROOT = 原始資料根目錄（= file_key 相對基底）；DATA_DOC_TYPE = 其下的文件種類
 # 資料夾（逗號分隔）。完整路徑 = DATA_ROOT / <選定的 DATA_DOC_TYPE> / …。審閱模式用下拉選
 # DATA_DOC_TYPE，清單與 fast pipeline 只含「該資料夾底下、且實體存在」的檔。
@@ -2158,6 +2161,41 @@ def _render_source_page_inline(source_path: Path, page: int, key_suffix: str,
         st.error(f"預覽失敗：\n```\n{e}\n```")
 
 
+@st.cache_data(show_spinner=False, ttl=300)
+def _locate_source_by_name(data_root_str: str, doc_type: str, filename: str) -> str:
+    """改名後備援：chunk 存的 file_key 失準（如建案資料夾被改名）時，用「實際檔名」在
+    `data_root/<類別>` 底下找實體檔，回絕對路徑字串；找不到回 ''。
+
+    對話歷史的 chunk payload 是檢索當下的快照、不會隨 Qdrant 修正更新；此後備讓舊對話的
+    「📂 開啟」仍能定位檔案（類別層通常沒改，只改建案層）。同檔名多筆 → 取第一個（罕見）。
+    cache 5 分鐘避免每 rerun 重掃。"""
+    base = Path(data_root_str) / doc_type if doc_type else Path(data_root_str)
+    if not base.exists():
+        base = Path(data_root_str)
+    try:
+        for p in base.rglob(filename):
+            if p.is_file():
+                return str(p)
+    except OSError:
+        pass
+    return ""
+
+
+def _resolve_chunk_source(data_root: Path, fk: str) -> Path:
+    """先試 data_root/file_key；不存在則用檔名在類別資料夾底下回退搜尋（對改名免疫）。"""
+    direct = data_root / fk
+    if direct.exists():
+        return direct
+    parts = split_key_parts(fk)
+    filename = parts[-1] if parts else ""
+    doc_type = parts[0] if len(parts) > 1 else ""
+    if filename:
+        found = _locate_source_by_name(str(data_root), doc_type, filename)
+        if found:
+            return Path(found)
+    return direct  # 仍找不到 → 回原路徑（不存在）→ UI 顯示「本機未找到」
+
+
 def _render_chunk_sources(
     chunks: list[dict],
     data_root: Path,
@@ -2173,7 +2211,7 @@ def _render_chunk_sources(
         return
     preview_state_key = f"{btn_key_prefix}_preview"  # 目前展開預覽的 (fk,pg) token
     for (fk, pg), info in groups.items():
-        pdf_path = data_root / fk
+        pdf_path = _resolve_chunk_source(data_root, fk)
         safe_fk = fk.replace("/", "_").replace("\\", "_")
         token = f"{safe_fk}|{pg}"
         row = st.columns([4, 2, 1], gap="small")
@@ -2399,12 +2437,18 @@ def _render_chat_view() -> None:
                 key="_chat_image_root",
                 help="右側資料塊圖片從這裡找（mkdata/ 預設）",
             )
+            # 一次性遷移：舊版預設誤指到 doc_type 子層（…/12.個案銷講資料），開檔會全 fail。
+            # 偵測到既有 session 還存著這個壞值就自動改回 DATA_ROOT，讓現有 session 立即生效
+            # （預設只在 key 不存在時生效、不會覆蓋既有值，故需此遷移）。見 [[open_file_data_root_layer_bug]]。
+            _good_data_root = DATA_ROOT_ENV or DEFAULT_DATA_PATH
+            if st.session_state.get("_chat_data_root") == r"D:/璞真RAG資料夾/12.個案銷講資料":
+                st.session_state["_chat_data_root"] = _good_data_root
             sb_data_root = st.text_input(
                 "原始檔根目錄（PDF/PPT 用）",
-                value=st.session_state.get("_chat_data_root", DEFAULT_DATA_PATH),
+                value=st.session_state.get("_chat_data_root", _good_data_root),
                 key="_chat_data_root",
-                help="開啟本機原始檔用：data_root / file_key。"
-                     "預設與審閱模式 sidebar 同款",
+                help="開啟本機原始檔用：data_root / file_key（須為 DATA_ROOT＝類別資料夾的父層）。"
+                     "預設與審閱模式 sidebar 同款（.env DATA_ROOT 優先）",
             )
 
     # ---- 主區 ----
