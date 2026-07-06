@@ -1789,6 +1789,40 @@ def restore_image_action(file_key: str, history_idx: int):
     bump_widget_version()
 
 
+def restore_all_images_action(file_key: str) -> int:
+    """一鍵復原本檔『近期刪除』的所有圖片（md 引用 + 垃圾桶檔案）。
+
+    以 LIFO（後刪先復原）逐筆呼叫 restore_image_action，確保同頁多刪時
+    line_offset 對位正確。回傳實際復原筆數；若某筆因頁面結構改變無法復原
+    （restore_image_action 提早 return 而未 pop），偵測到數量未減少即跳出，
+    避免死迴圈。
+    """
+    restored = 0
+    while st.session_state.delete_history.get(file_key):
+        before = len(st.session_state.delete_history[file_key])
+        restore_image_action(file_key, before - 1)
+        after = len(st.session_state.delete_history.get(file_key, []))
+        if after >= before:
+            break
+        restored += 1
+    return restored
+
+
+def restore_trashed_files_for(file_key: str) -> None:
+    """把本檔已軟刪除的圖檔從垃圾桶搬回原位（僅動檔案，不碰 md）。
+
+    供「捨棄編輯」使用：捨棄會從磁碟 reload md（引用本就還在），但實體檔仍在
+    垃圾桶，若不搬回會留下指向不存在檔案的孤兒引用。
+    """
+    for entry in st.session_state.delete_history.get(file_key, []):
+        tp = entry.get("trash_path")
+        if tp and Path(tp).exists():
+            try:
+                restore_from_trash(Path(tp), Path(entry["abs_path"]))
+            except Exception as e:
+                st.warning(f"圖檔還原失敗：{e}")
+
+
 # === UI ===
 st.set_page_config(page_title="RAG MD 比對工具", layout="wide")
 
@@ -3483,14 +3517,18 @@ with nav_cols[3]:
     if st.button("儲存 .md", type="primary", use_container_width=True):
         md_path.write_text(st.session_state.current_md, encoding="utf-8")
         mark_processing(selected_key)
+        # 儲存＝提交刪除：關閉圖片復原視窗（垃圾桶檔案自此視為永久刪除）
+        st.session_state.delete_history[selected_key] = []
         # 磁碟已動：捨棄編輯無法再無痛還原 prior_status（會留在 processing）
         sc = st.session_state.sidecars.get(selected_key)
         if sc is not None:
             sc["disk_dirty"] = True
-            persist_review_state(selected_key)
+        persist_review_state(selected_key)
         st.success(f"已儲存 → {md_path.name}")
 with nav_cols[4]:
     if st.button("捨棄編輯", use_container_width=True):
+        # 先把軟刪除的圖檔從垃圾桶搬回原位，否則 reload 回來的 md 引用會變孤兒
+        restore_trashed_files_for(selected_key)
         st.session_state.current_md = md_path.read_text(encoding="utf-8")
         st.session_state.delete_history[selected_key] = []
         # 還原：若進入 processing 前是 encoded/ingested 且磁碟未被儲存，回去原狀態
@@ -3639,6 +3677,21 @@ with tab_pdf:
 # --- 分頁 2：圖片校對 ---
 with tab_img:
     st.subheader("頁面圖片")
+    _img_history = st.session_state.delete_history.get(selected_key, [])
+    if _img_history:
+        restore_cols = st.columns([2, 3])
+        with restore_cols[0]:
+            if st.button(
+                f"↩ 復原全部已刪除圖片（{len(_img_history)}）",
+                key=f"restore_all_v{st.session_state.widget_version}",
+                use_container_width=True,
+            ):
+                restore_all_images_action(selected_key)
+                persist_review_state(selected_key)
+                st.rerun()
+        with restore_cols[1]:
+            st.caption("復原＝把垃圾桶圖檔搬回 + 重新插入 md 引用。"
+                       "**按下「儲存 .md」後刪除即提交，復原視窗關閉**。")
     refs = parse_images_in_page(page_md)
     if not refs:
         st.info("本頁無圖片引用。")
