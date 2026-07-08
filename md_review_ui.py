@@ -61,9 +61,13 @@ try:
         ChatBot,
         DEFAULT_SYSTEM_PROMPT as LLM_DEFAULT_SYSTEM_PROMPT,
         RAG_SYSTEM_PROMPT as LLM_RAG_SYSTEM_PROMPT,
+        COMPARE_SYSTEM_PROMPT as LLM_COMPARE_SYSTEM_PROMPT,
+        RANK_SYSTEM_PROMPT as LLM_RANK_SYSTEM_PROMPT,
         format_chunks as llm_format_chunks,
         generate_hyde as llm_generate_hyde,
         generate_title as llm_generate_title,
+        analyze_query as llm_analyze_query,
+        QueryPlan,
     )
     HAS_LLM = True
 except ImportError:
@@ -71,9 +75,13 @@ except ImportError:
     ChatBot = None
     LLM_DEFAULT_SYSTEM_PROMPT = ""
     LLM_RAG_SYSTEM_PROMPT = ""
+    LLM_COMPARE_SYSTEM_PROMPT = ""
+    LLM_RANK_SYSTEM_PROMPT = ""
     llm_format_chunks = None
     llm_generate_hyde = None
     llm_generate_title = None
+    llm_analyze_query = None
+    QueryPlan = None
     HAS_LLM = False
 
 # 對話紀錄「瀏覽器 localStorage」持久化（退化版：不再寫 server 磁碟，多人共用 server 時各自獨立）
@@ -147,6 +155,9 @@ _env_model_candidates = [
 ]
 LLM_MODEL_CHOICES = [m for m in _env_model_candidates if m]
 LLM_DEFAULT_TOP_K = 8
+# 三路意圖 router（第 1 層，見 memory: rag_comparison_routing_design）
+LLM_COMPARE_TOP_K_PER_ENTITY = 4   # compare/rank fan-out：每個建案各撈幾條
+LLM_MAX_FANOUT_ENTITIES = 12       # fan-out 建案數上限（超過截斷 + UI 提示，不靜默）
 LLM_DEFAULT_TEMPERATURE = 0.7   # 對齊 pipeline.ipynb + llm_chat.ChatBot 預設
 LLM_DEFAULT_TOP_P = 0.9
 LLM_DEFAULT_NUM_PREDICT = 4096
@@ -1683,6 +1694,195 @@ def search_hybrid(
     return res.points
 
 
+# === 三路意圖 router 檢索 helpers（第 1 層；見 rag_comparison_routing_design） ===
+
+def encode_queries(model, texts: list[str]) -> list[tuple[np.ndarray, dict]]:
+    """一次 batch encode 多條 query（bge-m3 收 list）→ [(dense, sparse), ...]，順序對齊 texts。
+
+    fan-out 的每建案改寫共用一次 encode，省去逐條呼叫開銷。bge-m3 symmetric，
+    query/passage 同 encoder，不套前綴（同 encode_query）。"""
+    if not texts:
+        return []
+    out = model.encode(
+        texts, return_dense=True, return_sparse=True, return_colbert_vecs=False,
+    )
+    dense_all = np.asarray(out["dense_vecs"], dtype=np.float32)
+    results: list[tuple[np.ndarray, dict]] = []
+    for i in range(len(texts)):
+        sparse = {str(k): float(v) for k, v in out["lexical_weights"][i].items()}
+        results.append((dense_all[i], sparse))
+    return results
+
+
+def resolve_entities(
+    mentions: list[str], known_projects: list[str],
+) -> tuple[list[tuple[int, str]], list[str]]:
+    """把 router 的 entity_mentions 對映到 collection 內實際存在的 project_name。
+
+    回 (pairs, unresolved)：
+      - pairs = [(mention_index, project_name), ...]，project_name 保證是實際 payload key
+        （metadata.source.project_name＝file_key[1]，見 doctype_project_path_model），
+        且 mention_index 用來把 plan.rewrites[i] 對齊回正確的建案（避免中途對不到時錯序）。
+      - unresolved = 對不到的原始 mention 字串（UI 需明講未納入，不靜默）。
+    比對用正規化（去空白 + 小寫）子字串雙向包含；一個 project 只配一次（先到先得）。"""
+    def _norm(s: str) -> str:
+        return "".join(str(s).split()).lower()
+
+    norm_known = [(p, _norm(p)) for p in known_projects]
+    pairs: list[tuple[int, str]] = []
+    unresolved: list[str] = []
+    used: set[str] = set()
+    for idx, m in enumerate(mentions):
+        nm = _norm(m)
+        hit = None
+        for proj, npj in norm_known:
+            if nm and (nm in npj or npj in nm) and proj not in used:
+                hit = proj
+                break
+        if hit:
+            pairs.append((idx, hit))
+            used.add(hit)
+        else:
+            unresolved.append(m)
+    return pairs, unresolved
+
+
+def fanout_retrieve(
+    embedder, cli, coll: str, search_mode: str,
+    entities: list[str], rewrites: list[str],
+    base_must: list, per_entity_k: int,
+) -> list[dict]:
+    """compare/rank 用：每個建案綁一段改寫、各做一次「加該建案 filter」的檢索，chunk 標
+    `_entity` 後合併。rewrites 與 entities 順序 1:1 對齊（空字串 → 退用建案名當 query）。
+    base_must＝sidebar 硬約束（專案/類別），與每建案的 project_name filter 以 AND 疊加。"""
+    if not entities:
+        return []
+    texts = [
+        (rewrites[i] if i < len(rewrites) and rewrites[i] else entities[i])
+        for i in range(len(entities))
+    ]
+    encoded = encode_queries(embedder, texts)
+    all_chunks: list[dict] = []
+    for ent, (q_dense, q_sparse) in zip(entities, encoded):
+        must = list(base_must) + [qm.FieldCondition(
+            key="metadata.source.project_name",
+            match=qm.MatchAny(any=[ent]),
+        )]
+        ent_filter = qm.Filter(must=must)
+        if search_mode == "dense":
+            hits = search_dense(cli, coll, q_dense, per_entity_k, ent_filter)
+        elif search_mode == "sparse":
+            hits = search_sparse(cli, coll, q_sparse, per_entity_k, ent_filter)
+        else:
+            hits = search_hybrid(cli, coll, q_dense, q_sparse, per_entity_k, ent_filter)
+        for h in hits:
+            all_chunks.append({"score": h.score, "payload": h.payload or {}, "_entity": ent})
+    return all_chunks
+
+
+def structured_lookup_stub(plan) -> None:
+    """第 2 層「人工結構化資料表」查詢插槽。**目前未接入 → 永遠回 None。**
+
+    未來接 Excel/CSV→pandas（一列一建案、欄位＝屬性、key＝project_name）時在此實作。
+    回 None 代表「資料表未收錄」，上游據此明講、**禁止 fall through 回向量猜數字**
+    （見 rag_comparison_routing_design 定案決策）。"""
+    return None
+
+
+def route_and_retrieve(
+    *, embedder, cli, coll: str, search_mode: str, query: str, top_k: int,
+    plan, base_must: list, sidebar_projects: list[str], sidebar_doc_types: list[str],
+    qdrant_url: str, qdrant_key: str,
+    llm_client=None, model: str = "", do_hyde: bool = False,
+    per_entity_k: int = LLM_COMPARE_TOP_K_PER_ENTITY,
+    max_entities: int = LLM_MAX_FANOUT_ENTITIES,
+) -> dict:
+    """依 plan.intent 三路檢索。回 {chunks, intent, grouped, notices}。
+
+    - plan=None（router 關閉／失敗／LLM 關閉）→ 一律單發 fact，等同現行行為。
+    - compare → 每建案 fan-out（需 ≥2 個對得上的建案，否則退 fact）。
+    - rank → structured_lookup_stub（恒 None，第 2 層未接入）→ 仍做檢索當「未排序參考」，
+      並掛未接入 notice；system prompt 端禁止 LLM 自行排序。
+    sidebar_projects 是硬約束：router 不得覆蓋（有指定就取交集 / 或直接用指定清單）。"""
+    notices: list[str] = []
+    intent = plan.intent if plan else "fact"
+
+    def _single_shot(k: int) -> list[dict]:
+        text = query
+        if do_hyde and llm_client is not None and llm_generate_hyde is not None:
+            try:
+                text = llm_generate_hyde(llm_client, model, query) or query
+            except Exception as e:  # noqa: BLE001 — HyDE 失敗不擋檢索
+                notices.append(f"HyDE 失敗，改用原 query：{e}")
+                text = query
+        d, s = encode_query(embedder, text)
+        flt = qm.Filter(must=base_must) if base_must else None
+        if search_mode == "dense":
+            hits = search_dense(cli, coll, d, k, flt)
+        elif search_mode == "sparse":
+            hits = search_sparse(cli, coll, s, k, flt)
+        else:
+            hits = search_hybrid(cli, coll, d, s, k, flt)
+        return [{"score": h.score, "payload": h.payload or {}} for h in hits]
+
+    def _resolve() -> tuple[list[str], list[str], list[str]]:
+        """回 (entities, rewrites_aligned, unresolved)。含 sidebar 硬約束 + 上限截斷。"""
+        known = list_projects_in_collection(
+            qdrant_url, qdrant_key, coll, doc_types=sidebar_doc_types or None,
+        )
+        pairs, unresolved = resolve_entities(plan.entity_mentions if plan else [], known)
+        if sidebar_projects:  # 硬約束：router 對到的取交集；都對不到就直接用 sidebar 清單
+            inter = [(i, p) for (i, p) in pairs if p in sidebar_projects]
+            if inter:
+                pairs = inter
+            else:
+                pairs = [(-1, p) for p in sidebar_projects]
+                unresolved = []
+        if len(pairs) > max_entities:
+            notices.append(
+                f"比較／排序實體超過上限 {max_entities}，只取前 {max_entities} 個（原 {len(pairs)} 個）。"
+            )
+            pairs = pairs[:max_entities]
+        ents = [p for _, p in pairs]
+        rws = [
+            (plan.rewrites[i] if (plan and 0 <= i < len(plan.rewrites)) else "")
+            for i, _ in pairs
+        ]
+        return ents, rws, unresolved
+
+    if intent == "compare":
+        ents, rws, unresolved = _resolve()
+        if len(ents) >= 2:
+            chunks = fanout_retrieve(
+                embedder, cli, coll, search_mode, ents, rws, base_must, per_entity_k,
+            )
+            if unresolved:
+                notices.append("下列指涉未對應到資料庫建案、未納入比較：" + "、".join(unresolved))
+            return {"chunks": chunks, "intent": "compare", "grouped": True, "notices": notices}
+        # 對不到 ≥2 建案 → 退回單發 fact，明講原因
+        if plan and plan.entity_mentions:
+            notices.append("未能在資料庫對應到 2 個以上的具名建案，已退回一般檢索。")
+        return {"chunks": _single_shot(top_k), "intent": "fact", "grouped": False, "notices": notices}
+
+    if intent == "rank":
+        _ = structured_lookup_stub(plan)  # 恒 None：第 2 層資料表未接入
+        notices.append(
+            "⚠️ 排序／極值查詢的『結構化資料表（第 2 層）』尚未接入；以下為**未排序**參考資料，"
+            "系統不會自行排名或聚合數字。"
+        )
+        ents, rws, _unresolved = _resolve()
+        if len(ents) >= 2:
+            chunks = fanout_retrieve(
+                embedder, cli, coll, search_mode, ents, rws, base_must, per_entity_k,
+            )
+            return {"chunks": chunks, "intent": "rank", "grouped": True, "notices": notices}
+        # 沒有可 fan-out 的建案 → 單發撈參考片段（不排序，交由 RANK prompt 約束 LLM）
+        return {"chunks": _single_shot(top_k), "intent": "rank", "grouped": False, "notices": notices}
+
+    # fact（含所有 fallback 路徑）
+    return {"chunks": _single_shot(top_k), "intent": "fact", "grouped": False, "notices": notices}
+
+
 # === Streamlit Callback ===
 def editor_key_for(file_key: str, page_idx: int, version: int) -> str:
     return f"editor_{file_key}_{page_idx}_v{version}"
@@ -2427,6 +2627,16 @@ def _render_chat_view() -> None:
                 key="_chat_rag_on",
                 help="關掉 = 純 LLM 對話（不檢索）",
             )
+            sb_smart_route = st.toggle(
+                "🧭 智慧路由（比較／排序題）",
+                value=st.session_state.get("_chat_smart_route", True),
+                key="_chat_smart_route",
+                help="開＝先用 LLM 判斷意圖再分派檢索：\n"
+                     "・比較題 → 對每個建案各撈一次（涵蓋率不再靠 top-k 運氣）\n"
+                     "・排序／極值題 → 明講排序資料表（第 2 層）尚未接入、不自行排名\n"
+                     "・一般題 → 現行單發檢索\n"
+                     "需 LLM 開啟；LLM 關閉或路由失敗時自動退回單發。",
+            )
             # 「指定專案」多選框不放這裡，改置於聊天室正上方的 sticky bar（見主區）
 
         # LLM 參數
@@ -2579,6 +2789,8 @@ def _render_chat_view() -> None:
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
                 if m["role"] == "assistant":
+                    for _note in (m.get("notices") or []):
+                        st.caption(f"🧭 {_note}")
                     msg_chunks = m.get("chunks") or []
                     if msg_chunks:
                         with st.expander(
@@ -2667,6 +2879,9 @@ def _render_chat_view() -> None:
 
         # 1. RAG 檢索：RAG 開啟，或 LLM 關閉（僅檢索模式必須有結果可展示）時都要跑
         rag_chunks: list[dict] = []
+        route_intent = "fact"          # 三路 router 結果：fact / compare / rank
+        route_grouped = False          # chunks 是否依建案分組（compare/rank fan-out）
+        route_notices: list[str] = []  # 給使用者看的路由訊息（截斷/未對應/退回等，不靜默）
         do_retrieval = sb_rag_on or not sb_llm_on
         if do_retrieval:
             if not HAS_QDRANT:
@@ -2691,17 +2906,8 @@ def _render_chat_view() -> None:
 
             llm_cli = get_llm_client(sb_llm_url)
 
-            # 2. HyDE 改寫（可選；LLM 關閉時不做，避免任何 LLM 呼叫）
-            embed_query_text = q
-            if sb_hyde and sb_llm_on:
-                try:
-                    with st.spinner("HyDE 改寫中..."):
-                        embed_query_text = llm_generate_hyde(llm_cli, active_model, q)
-                except Exception as e:
-                    st.warning(f"HyDE 失敗，fallback 用原 query：{e}")
-                    embed_query_text = q
-
-            # 篩選 filter：專案 + 文件種類各為一條 must（條內 OR、條間 AND）；皆留空＝None＝不篩
+            # 2. 意圖路由。base_must＝sidebar 硬約束（專案 + 文件種類；條內 OR、條間 AND），
+            #    router 不得覆蓋。僅「LLM 開 + 智慧路由開」才呼叫 router；否則 plan=None → 單發 fact。
             _must = []
             if sb_projects:
                 _must.append(qm.FieldCondition(
@@ -2713,27 +2919,55 @@ def _render_chat_view() -> None:
                     key="metadata.source.doc_type",
                     match=qm.MatchAny(any=list(sb_doc_types)),
                 ))
-            chat_filter = qm.Filter(must=_must) if _must else None
 
-            # 3. encode + search（失敗也走 _chat_fail，不留孤兒 user）
+            plan = None
+            if sb_smart_route and sb_llm_on and llm_analyze_query is not None:
+                try:
+                    with st.spinner("分析查詢意圖..."):
+                        plan = llm_analyze_query(llm_cli, active_model, q)
+                except Exception as e:  # noqa: BLE001 — router 失敗 → 退回單發 fact，UI 明講
+                    plan = None
+                    route_notices.append(f"智慧路由失敗，已退回一般檢索：{e}")
+
+            # 3. 依 plan 三路檢索（fact 單發 / compare 每建案 fan-out / rank 未排序參考）。
+            #    失敗也走 _chat_fail，不留孤兒 user。
+            _intent = plan.intent if plan else "fact"
+            _label = {
+                "compare": "逐建案比較檢索",
+                "rank": "排序題參考檢索",
+            }.get(_intent, f"檢索中（{sb_search_mode} top-{sb_top_k}）")
             try:
-                with st.spinner(f"檢索中（{sb_search_mode} top-{sb_top_k}）..."):
-                    q_dense, q_sparse = encode_query(embedder, embed_query_text)
-                    if sb_search_mode == "dense":
-                        hits = search_dense(cli, sb_qdrant_coll, q_dense, int(sb_top_k), chat_filter)
-                    elif sb_search_mode == "sparse":
-                        hits = search_sparse(cli, sb_qdrant_coll, q_sparse, int(sb_top_k), chat_filter)
-                    else:
-                        hits = search_hybrid(cli, sb_qdrant_coll, q_dense, q_sparse, int(sb_top_k), chat_filter)
+                with st.spinner(f"{_label}..."):
+                    _route = route_and_retrieve(
+                        embedder=embedder, cli=cli, coll=sb_qdrant_coll,
+                        search_mode=sb_search_mode, query=q, top_k=int(sb_top_k),
+                        plan=plan, base_must=_must,
+                        sidebar_projects=list(sb_projects),
+                        sidebar_doc_types=list(sb_doc_types),
+                        qdrant_url=sb_qdrant_url, qdrant_key=sb_qdrant_key,
+                        llm_client=llm_cli, model=active_model,
+                        do_hyde=(sb_hyde and sb_llm_on),
+                    )
             except Exception as e:
                 _chat_fail(active_sess, f"⚠️ 檢索失敗：\n```\n{e}\n```")
-            rag_chunks = [{"score": h.score, "payload": h.payload or {}} for h in hits]
+            rag_chunks = _route["chunks"]
+            route_intent = _route["intent"]
+            route_grouped = _route["grouped"]
+            route_notices.extend(_route["notices"])
         else:
             llm_cli = get_llm_client(sb_llm_url)
 
         if sb_llm_on:
-            # 4. 組 messages
-            sys_prompt = LLM_RAG_SYSTEM_PROMPT if rag_chunks else LLM_DEFAULT_SYSTEM_PROMPT
+            # 4. 組 messages。system prompt 依意圖路由選：compare → 逐案比較 + 涵蓋率提醒；
+            #    rank → 明講第 2 層未接入、禁止自行排序；fact → 現行 RAG / 純對話。
+            if route_intent == "compare":
+                sys_prompt = LLM_COMPARE_SYSTEM_PROMPT or LLM_RAG_SYSTEM_PROMPT
+            elif route_intent == "rank":
+                sys_prompt = LLM_RANK_SYSTEM_PROMPT or LLM_RAG_SYSTEM_PROMPT
+            elif rag_chunks:
+                sys_prompt = LLM_RAG_SYSTEM_PROMPT
+            else:
+                sys_prompt = LLM_DEFAULT_SYSTEM_PROMPT
             messages = [{"role": "system", "content": sys_prompt}]
             # 歷史（不含剛加的 user msg）
             prior = active_sess["messages"][:-1]
@@ -2743,7 +2977,7 @@ def _render_chat_view() -> None:
                 prior = prior[:-1]
             messages.extend(prior[-10:])  # 保留近 5 輪（user+assistant）
             if rag_chunks:
-                ctx_text = llm_format_chunks(rag_chunks)
+                ctx_text = llm_format_chunks(rag_chunks, group_by_entity=route_grouped)
                 messages.append({
                     "role": "user",
                     "content": f"【參考資料】\n{ctx_text}\n\n【問題】\n{q}",
@@ -2780,11 +3014,14 @@ def _render_chat_view() -> None:
             with live_turn:
                 with st.chat_message("assistant"):
                     st.markdown(answer)
+                    for _note in route_notices:
+                        st.caption(f"🧭 {_note}")
 
         active_sess["messages"].append({
             "role": "assistant",
             "content": answer,
             "chunks": rag_chunks,
+            "notices": route_notices,
         })
 
         # auto-title：title 仍是預設「新對話」就用「第一則 user 問題」生成重點標題；
