@@ -28,7 +28,6 @@ from uuid import NAMESPACE_DNS, uuid5
 import fitz
 import numpy as np
 import streamlit as st
-import streamlit.components.v1 as components
 
 # 對齊 pipeline.ipynb / LLM_prompt_test.py：用 .env 統一 ollama 設定
 try:
@@ -630,48 +629,45 @@ def render_pdf_page_png(pdf_path: Path, page_idx: int, dpi: int = 110) -> bytes:
     return _render_pdf_page_png_cached(str(pdf_path), mtime, page_idx, dpi)
 
 
-# 新分頁大圖的渲染 DPI。預覽框走低 DPI（快），但「開新分頁」時用高 DPI 重新光柵化，
-# 讓瀏覽器原生看圖器可自由縮放且不糊——這正是預覽框內建 fullscreen（fit-to-viewport）做不到的。
-HIGH_DPI_OPEN = 300
+# 「開啟原圖」用：把整頁高解析 PNG 落到 Streamlit 靜態服務目錄，回傳可用 <a target=_blank>
+# 開新分頁的真實 URL。這是 server 端按鈕唯一能可靠開新分頁的方式——真實 http URL 不會被
+# 瀏覽器擋（不像 data:/blob:）。需 .streamlit/config.toml 開 enableStaticServing。
+# 目錄專用，只放/刪本功能自產的 png，絕不碰 ./static 下其他內容（如 fonts/）。
+PAGE_PREVIEW_DIR = Path("./static/_page_preview")
+_PAGE_PREVIEW_KEEP = 60  # 只保留最新 N 張，避免無限長大
 
 
-def open_png_in_new_tab_button(png_bytes: bytes, label: str, key: str) -> None:
-    """在新分頁開啟 PNG（真正的 <a target="_blank"> 連結）。
+def _prune_page_preview_dir(keep: int = _PAGE_PREVIEW_KEEP) -> None:
+    try:
+        pngs = sorted(
+            PAGE_PREVIEW_DIR.glob("*.png"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in pngs[keep:]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
 
-    不用 `data:` URL：Chrome/Edge 會擋 top-frame 導向 data URL。
-    也不用 `window.open`：它最容易被彈窗攔截器擋（尤其 open 前有耗時運算時）。
-    改成 iframe 載入時就把 base64 → Blob → objectURL 建好掛到 <a> 上，使用者直接點
-    連結導頁——這是瀏覽器最不會攔的形式，且 Streamlit component iframe sandbox
-    已含 allow-popups / allow-popups-to-escape-sandbox。
+
+def high_dpi_preview_url(pdf_path: Path, page_idx: int, dpi: int) -> str:
+    """渲染整頁 PNG 落到 ./static/_page_preview，回傳 `app/static/...` 相對 URL。
+
+    檔名＝(絕對路徑, mtime, 頁碼, dpi) 的 hash → 同頁同 DPI 重用同檔、不重覆寫；PDF 內容
+    變動（mtime 變）會自然換新檔。回傳相對 URL（非絕對 /app/...）以相容部屬 baseUrlPath。
     """
-    b64 = base64.b64encode(png_bytes).decode("ascii")
-    html = f"""
-    <a id="{key}" target="_blank" rel="noopener" style="
-        display:block; text-align:center; text-decoration:none;
-        padding:0.5rem 0.75rem; cursor:pointer;
-        border:1px solid rgba(49,51,63,0.2); border-radius:0.5rem;
-        background:#fff; color:#9a9a9a; font-size:0.9rem; font-weight:600;
-        font-family:'Source Sans Pro',sans-serif;">{label}（產生中…）</a>
-    <script>
-    (function() {{
-        try {{
-            const bin = atob("{b64}");
-            const bytes = new Uint8Array(bin.length);
-            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-            const url = URL.createObjectURL(new Blob([bytes], {{type: "image/png"}}));
-            const a = document.getElementById("{key}");
-            a.href = url;
-            a.textContent = "{label}";
-            a.style.color = "#31333F";
-        }} catch (e) {{
-            const a = document.getElementById("{key}");
-            a.textContent = "產生大圖失敗：" + e.message;
-            a.style.color = "#d33";
-        }}
-    }})();
-    </script>
-    """
-    components.html(html, height=48)
+    mtime = pdf_path.stat().st_mtime
+    token = f"{pdf_path.resolve()}|{mtime}|{page_idx}|{dpi}"
+    name = hashlib.md5(token.encode("utf-8")).hexdigest()[:16] + ".png"
+    out = PAGE_PREVIEW_DIR / name
+    if not out.exists():
+        PAGE_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(render_pdf_page_png(pdf_path, page_idx, dpi=dpi))
+        _prune_page_preview_dir()
+    return f"app/static/{PAGE_PREVIEW_DIR.name}/{name}"
 
 
 # 原檔下載用的 MIME 對照（用於「下載原檔」鈕）。
@@ -3680,7 +3676,11 @@ with st.sidebar:
     )
     st.markdown(legend_chips, unsafe_allow_html=True)
 
-    dpi = st.slider("PDF 渲染 DPI", 60, 200, 110, step=10)
+    dpi = st.slider(
+        "PDF 渲染 DPI", 60, 400, 110, step=10,
+        help="預覽清晰度。右鍵「在新分頁中開啟圖片」放大看小字時，"
+             "清晰度就是這個 DPI；CAD 細字建議 250–400。DPI 越高越清楚但越慢。",
+    )
 
     st.divider()
     st.subheader("圖片校對顯示")
@@ -3925,23 +3925,17 @@ with tab_pdf:
                 png_bytes = render_pdf_page_png(pdf_path, page_num - 1, dpi=dpi)
                 st.image(png_bytes, use_container_width=True)
 
-                # 預覽框右上角的內建 fullscreen 是 fit-to-viewport（放大網頁只會重新縮圖，
-                # 且來源 DPI 低），看不到小字。下面兩顆鈕徹底繞過這限制：
+                # 預覽框右上角內建 fullscreen 是 fit-to-viewport（放大網頁只會重新縮圖），
+                # 看不到小字。「開啟原圖」用真實靜態 URL 在新分頁開整頁原圖 → 瀏覽器原生縮放。
                 open_col, dl_col = st.columns(2)
                 with open_col:
-                    if st.checkbox(
-                        "🔍 產生高 DPI 大圖",
-                        key=f"hidpi_{selected_key}_{page_num}",
-                        help=f"以 {HIGH_DPI_OPEN} DPI 重新渲染本頁，勾選後按下方按鈕於新分頁開啟，"
-                             "可用瀏覽器原生縮放自由放大且不糊。",
-                    ):
-                        hidpi_dpi = max(HIGH_DPI_OPEN, dpi)
-                        hi_png = render_pdf_page_png(pdf_path, page_num - 1, dpi=hidpi_dpi)
-                        open_png_in_new_tab_button(
-                            hi_png,
-                            f"↗ 用新分頁開原圖（{hidpi_dpi} DPI）",
-                            key=f"opentab_{selected_key}_{page_num}",
-                        )
+                    st.link_button(
+                        "🔍 開啟原圖",
+                        high_dpi_preview_url(pdf_path, page_num - 1, dpi),
+                        use_container_width=True,
+                        help="在新分頁開啟本頁完整解析度圖，可用瀏覽器原生縮放自由放大。"
+                             "清晰度＝左側「PDF 渲染 DPI」，字太小就調高再開。",
+                    )
                 with dl_col:
                     st.download_button(
                         "⬇️ 下載原檔",
