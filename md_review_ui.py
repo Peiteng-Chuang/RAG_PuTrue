@@ -636,30 +636,38 @@ HIGH_DPI_OPEN = 300
 
 
 def open_png_in_new_tab_button(png_bytes: bytes, label: str, key: str) -> None:
-    """在新分頁開啟 PNG（走 Blob URL）。
+    """在新分頁開啟 PNG（真正的 <a target="_blank"> 連結）。
 
-    不用 `data:` URL：Chrome/Edge 會擋 top-frame 導向 data URL（"Not allowed to
-    navigate top frame to data URL"）。改在使用者點擊當下把 base64 → Blob →
-    objectURL 再 window.open，才不會被擋，也不受 popup blocker 影響（有 user gesture）。
+    不用 `data:` URL：Chrome/Edge 會擋 top-frame 導向 data URL。
+    也不用 `window.open`：它最容易被彈窗攔截器擋（尤其 open 前有耗時運算時）。
+    改成 iframe 載入時就把 base64 → Blob → objectURL 建好掛到 <a> 上，使用者直接點
+    連結導頁——這是瀏覽器最不會攔的形式，且 Streamlit component iframe sandbox
+    已含 allow-popups / allow-popups-to-escape-sandbox。
     """
     b64 = base64.b64encode(png_bytes).decode("ascii")
     html = f"""
-    <button id="{key}" style="
-        width:100%; padding:0.5rem 0.75rem; cursor:pointer;
+    <a id="{key}" target="_blank" rel="noopener" style="
+        display:block; text-align:center; text-decoration:none;
+        padding:0.5rem 0.75rem; cursor:pointer;
         border:1px solid rgba(49,51,63,0.2); border-radius:0.5rem;
-        background:#fff; color:#31333F; font-size:0.9rem; font-weight:600;
-        font-family:'Source Sans Pro',sans-serif;">{label}</button>
+        background:#fff; color:#9a9a9a; font-size:0.9rem; font-weight:600;
+        font-family:'Source Sans Pro',sans-serif;">{label}（產生中…）</a>
     <script>
     (function() {{
-        const b64 = "{b64}";
-        const btn = document.getElementById("{key}");
-        btn.onclick = function() {{
-            const bin = atob(b64);
+        try {{
+            const bin = atob("{b64}");
             const bytes = new Uint8Array(bin.length);
             for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
             const url = URL.createObjectURL(new Blob([bytes], {{type: "image/png"}}));
-            window.open(url, "_blank");
-        }};
+            const a = document.getElementById("{key}");
+            a.href = url;
+            a.textContent = "{label}";
+            a.style.color = "#31333F";
+        }} catch (e) {{
+            const a = document.getElementById("{key}");
+            a.textContent = "產生大圖失敗：" + e.message;
+            a.style.color = "#d33";
+        }}
     }})();
     </script>
     """
