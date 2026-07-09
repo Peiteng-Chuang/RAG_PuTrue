@@ -1,0 +1,30 @@
+# Streamlit 部屬設定 —— 與「執行時自動斷線」治本有關的部分
+#
+# 斷線根因（程式側已修）：送出流程過去是非串流、ollama timeout=None 的同步阻塞，
+# 生成期間 websocket idle → 被部屬層剪斷。已改為「串流輸出 + 有界 timeout」。
+# 這裡再收掉部屬層的兩個隱性斷線/重連來源。
+
+[server]
+# 關掉檔案監看：避免部屬機上編輯原始碼、或 mkdata/ 落盤（chat_sessions.json 等）
+# 被偵測為變更而觸發 rerun / 連線重置。正式部屬不需要 hot-reload。
+fileWatcherType = "none"
+runOnSave = false
+
+# 多人同時連線時，後端對單一 session 的阻塞不影響其他 session 的建立。
+# headless 讓容器內啟動不嘗試開瀏覽器。
+headless = true
+
+# 開啟 ./static 靜態檔案服務：PDF 比對頁的「開啟原圖」用真實 http URL
+# （app/static/...）在新分頁開整頁高解析圖。server 端按鈕唯一能可靠開新分頁的方式。
+# 變更此項需「重啟 Streamlit process」才生效（非 rerun）。
+enableStaticServing = true
+
+[browser]
+gatherUsageStats = false
+
+# === 反向代理注意事項（若部屬機前面有 nginx / IIS / Cloudflare）===
+# 即使已串流，仍請確認代理的 websocket idle / read timeout 夠長，否則
+# 檢索 + 首 token 之間的短暫空檔仍可能被剪斷。建議：
+#   nginx:  proxy_read_timeout 3600s;  proxy_send_timeout 3600s;
+#           並轉發 Upgrade / Connection 標頭（websocket upgrade）。
+#   IIS  :  ARR -> Proxy Timeout 調高；啟用 WebSocket Protocol。

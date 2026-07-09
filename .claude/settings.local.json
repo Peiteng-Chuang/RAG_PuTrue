@@ -51,7 +51,14 @@
       "Bash(/c/project_file/RAG_PuTrue/venv312/Scripts/python.exe *)",
       "WebSearch",
       "WebFetch(domain:dify.ai)",
-      "Bash(PYTHONPATH=\"C:/project_file/RAG_PuTrue\" ./venv312/Scripts/python.exe *)"
+      "Bash(PYTHONPATH=\"C:/project_file/RAG_PuTrue\" ./venv312/Scripts/python.exe *)",
+      "Bash(grep -oE 'sandbox[^;]{0,120}' \"C:/project_file/RAG_PuTrue/venv312/Lib/site-packages/streamlit/static/static/js/IFrame.CWtgwiOd.js\")",
+      "Bash(grep -oE '.{80}sandbox:o.{0,20}' \"C:/project_file/RAG_PuTrue/venv312/Lib/site-packages/streamlit/static/static/js/IFrame.CWtgwiOd.js\")",
+      "Bash(grep -oE 'allow[- a-z]{5,120}' \"C:/project_file/RAG_PuTrue/venv312/Lib/site-packages/streamlit/static/static/js/IFrame.CWtgwiOd.js\")",
+      "Bash(grep -oE 'o=[^;]{0,200}' \"C:/project_file/RAG_PuTrue/venv312/Lib/site-packages/streamlit/static/static/js/IFrame.CWtgwiOd.js\")",
+      "Bash(./venv312/Scripts/python *)",
+      "Bash(ipconfig)",
+      "Bash(powershell -NoProfile -Command \"\\(Get-NetIPAddress -AddressFamily IPv4 | Select-Object -ExpandProperty IPAddress\\)\")"
     ]
   }
 }
