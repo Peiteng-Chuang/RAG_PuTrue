@@ -28,6 +28,7 @@ from uuid import NAMESPACE_DNS, uuid5
 import fitz
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 
 # 對齊 pipeline.ipynb / LLM_prompt_test.py：用 .env 統一 ollama 設定
 try:
@@ -627,6 +628,50 @@ def _render_pdf_page_png_cached(pdf_path_str: str, mtime: float, page_idx: int, 
 def render_pdf_page_png(pdf_path: Path, page_idx: int, dpi: int = 110) -> bytes:
     mtime = pdf_path.stat().st_mtime
     return _render_pdf_page_png_cached(str(pdf_path), mtime, page_idx, dpi)
+
+
+# 新分頁大圖的渲染 DPI。預覽框走低 DPI（快），但「開新分頁」時用高 DPI 重新光柵化，
+# 讓瀏覽器原生看圖器可自由縮放且不糊——這正是預覽框內建 fullscreen（fit-to-viewport）做不到的。
+HIGH_DPI_OPEN = 300
+
+
+def open_png_in_new_tab_button(png_bytes: bytes, label: str, key: str) -> None:
+    """在新分頁開啟 PNG（走 Blob URL）。
+
+    不用 `data:` URL：Chrome/Edge 會擋 top-frame 導向 data URL（"Not allowed to
+    navigate top frame to data URL"）。改在使用者點擊當下把 base64 → Blob →
+    objectURL 再 window.open，才不會被擋，也不受 popup blocker 影響（有 user gesture）。
+    """
+    b64 = base64.b64encode(png_bytes).decode("ascii")
+    html = f"""
+    <button id="{key}" style="
+        width:100%; padding:0.5rem 0.75rem; cursor:pointer;
+        border:1px solid rgba(49,51,63,0.2); border-radius:0.5rem;
+        background:#fff; color:#31333F; font-size:0.9rem; font-weight:600;
+        font-family:'Source Sans Pro',sans-serif;">{label}</button>
+    <script>
+    (function() {{
+        const b64 = "{b64}";
+        const btn = document.getElementById("{key}");
+        btn.onclick = function() {{
+            const bin = atob(b64);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            const url = URL.createObjectURL(new Blob([bytes], {{type: "image/png"}}));
+            window.open(url, "_blank");
+        }};
+    }})();
+    </script>
+    """
+    components.html(html, height=48)
+
+
+# 原檔下載用的 MIME 對照（用於「下載原檔」鈕）。
+_DOWNLOAD_MIME = {
+    ".pdf": "application/pdf",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
 
 
 def strip_page_header(page_md: str) -> str:
@@ -3871,6 +3916,34 @@ with tab_pdf:
                 pdf_path = ensure_pdf(source_path, soffice_path)
                 png_bytes = render_pdf_page_png(pdf_path, page_num - 1, dpi=dpi)
                 st.image(png_bytes, use_container_width=True)
+
+                # 預覽框右上角的內建 fullscreen 是 fit-to-viewport（放大網頁只會重新縮圖，
+                # 且來源 DPI 低），看不到小字。下面兩顆鈕徹底繞過這限制：
+                open_col, dl_col = st.columns(2)
+                with open_col:
+                    if st.checkbox(
+                        "🔍 產生高 DPI 大圖",
+                        key=f"hidpi_{selected_key}_{page_num}",
+                        help=f"以 {HIGH_DPI_OPEN} DPI 重新渲染本頁，勾選後按下方按鈕於新分頁開啟，"
+                             "可用瀏覽器原生縮放自由放大且不糊。",
+                    ):
+                        hidpi_dpi = max(HIGH_DPI_OPEN, dpi)
+                        hi_png = render_pdf_page_png(pdf_path, page_num - 1, dpi=hidpi_dpi)
+                        open_png_in_new_tab_button(
+                            hi_png,
+                            f"↗ 用新分頁開原圖（{hidpi_dpi} DPI）",
+                            key=f"opentab_{selected_key}_{page_num}",
+                        )
+                with dl_col:
+                    st.download_button(
+                        "⬇️ 下載原檔",
+                        data=source_path.read_bytes(),
+                        file_name=source_path.name,
+                        mime=_DOWNLOAD_MIME.get(ext, "application/octet-stream"),
+                        use_container_width=True,
+                        key=f"dlsrc_{selected_key}_{page_num}",
+                        help="下載原始檔（PDF/PPT/PPTX），用本機看圖／閱讀器開啟。",
+                    )
             except Exception as e:
                 st.error(f"PDF 渲染失敗：\n```\n{e}\n```")
 
