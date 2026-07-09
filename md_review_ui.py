@@ -633,7 +633,11 @@ def render_pdf_page_png(pdf_path: Path, page_idx: int, dpi: int = 110) -> bytes:
 # 開新分頁的真實 URL。這是 server 端按鈕唯一能可靠開新分頁的方式——真實 http URL 不會被
 # 瀏覽器擋（不像 data:/blob:）。需 .streamlit/config.toml 開 enableStaticServing。
 # 目錄專用，只放/刪本功能自產的 png，絕不碰 ./static 下其他內容（如 fonts/）。
-PAGE_PREVIEW_DIR = Path("./static/_page_preview")
+#
+# 錨定到「本腳本所在目錄/static」，而非 CWD：Streamlit 以 os.path.abspath(script)
+# 的 parent/static 作為靜態服務根（與行程 CWD 無關），用 __file__ 對齊才不會把檔案
+# 寫到「服務不到」的目錄（正是先前 /app/static 404 的元兇之一）。
+PAGE_PREVIEW_DIR = Path(__file__).resolve().parent / "static" / "_page_preview"
 _PAGE_PREVIEW_KEEP = 60  # 只保留最新 N 張，避免無限長大
 
 
