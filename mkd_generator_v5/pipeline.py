@@ -61,6 +61,7 @@ class RAGPipeline:
         backfill_title_from_marker: bool = True,  # marker 補抓 h3
         enable_triage_log: bool = True,           # S1: 寫 triage decision log
         marker_pool_workers: int = 0,             # S3: 0=sequential, >0=process pool
+        black_image_threshold: int = 8,           # W6: 全黑圖偵測閾值（各通道 max<=此值即排除）
     ):
         self.converter = converter
         self.template_filter = template_filter
@@ -75,6 +76,7 @@ class RAGPipeline:
         self.backfill_title_from_marker = backfill_title_from_marker
         self.enable_triage_log = enable_triage_log
         self.marker_pool_workers = marker_pool_workers
+        self.black_image_threshold = black_image_threshold
 
     # ---- public ----
 
@@ -150,6 +152,7 @@ class RAGPipeline:
                 saved_image_hashes=set(),
                 hash_to_filename={},
                 doc=doc,
+                black_threshold=self.black_image_threshold,
             )
             fragments: list[PageFragment] = []
             vector_indices: list[int] = []
@@ -277,6 +280,10 @@ class RAGPipeline:
                 self.reporter.warning(
                     f"{_unresolved} 頁 Marker 未解析 → 已填註記（非 placeholder 洩漏）"
                 )
+
+            # W6：全黑圖排除統計（fast + marker 兩路徑累積後定案）；
+            # 由 FileStats.summary_line 統一顯示 black_img_skipped=N
+            stats.black_image_skipped = filter_state.black_image_skipped
 
             # S1: 寫 triage decision log（在 stitch 前，避免影響 ETL 成功與否）
             if self.enable_triage_log and triage_log:

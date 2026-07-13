@@ -22,6 +22,11 @@ class FilterState:
     # None = bad xref (PyMuPDF extract_image raise ValueError)，下游看到直接 skip 不重試
     warnings: list[str] = field(default_factory=list)
     # P1: template scan 階段累積的 warnings，pipeline 在 FITZ_SCAN_DONE 後統一 emit reporter.warning
+    black_image_hashes: set[str] = field(default_factory=set)
+    # W6：確認為「全黑/全透明」的無效圖 hash（PPT→LibreOffice→PDF 剝 SMask 後的黑塊）。
+    # 一旦某 hash 判為黑就 cache，跨頁/跨 fast|slow 路徑不再重複解碼判定。
+    black_image_skipped: int = 0
+    # W6：本檔累積跳過的黑圖「出現次數」（含跨頁重複出現），供 FileStats 顯示。
 
 
 @dataclass
@@ -95,6 +100,7 @@ class ExtractContext:
     hash_to_filename: dict[str, str]
     doc: Any                               # fitz.Document，fast 路徑要 doc.extract_image(xref)
     min_image_dim: int = 60                # 過濾過小圖片的閾值
+    black_threshold: int = 8               # W6：像素各通道最大值 <= 此值即判「全黑」（0-255）
 
 
 @dataclass
@@ -135,6 +141,7 @@ class FileStats:
     bad_xref_count: int = 0          # template scan 偵測到的 bad xref 張數
     triage_fallback_count: int = 0    # triage.route 失敗 fallback fast 的頁數
     marker_unresolved_pages: int = 0  # Marker 未解析、填註記的頁數（避免 placeholder 洩漏）
+    black_image_skipped: int = 0      # W6：跳過的全黑/全透明無效圖出現次數
     warning_count: int = 0            # 本檔累積 warning 總數
 
     def summary_line(self) -> str:
@@ -149,6 +156,8 @@ class FileStats:
             parts.append(f"triage_fallback={self.triage_fallback_count}")
         if self.marker_unresolved_pages:
             parts.append(f"marker_unresolved={self.marker_unresolved_pages}")
+        if self.black_image_skipped:
+            parts.append(f"black_img_skipped={self.black_image_skipped}")
         if self.warning_count:
             parts.append(f"warnings={self.warning_count}")
         return " · ".join(parts)

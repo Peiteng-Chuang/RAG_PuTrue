@@ -14,6 +14,38 @@ from typing import Any
 from ..types import ExtractContext, ImageRef
 from .template import _visible_image_xrefs_on_page
 
+try:
+    from PIL import Image as _PILImage
+except ImportError:  # 無 PIL 環境：降級為不做黑圖偵測（回 False = 一律當有效）
+    _PILImage = None
+
+
+def _is_all_black(img_bytes: bytes, threshold: int) -> bool:
+    """判斷影像 bytes 是否為「無效黑圖」：全黑（各通道 max <= threshold）或全透明。
+
+    根因：PPT→LibreOffice→PDF 後，帶透明度的元素被存成 base + 獨立 SMask，
+    fitz `extract_image()` 只回 base、丟掉 alpha，透明區的 base 像素多為 (0,0,0)，
+    剝掉 alpha 就變成大小不一的實心黑塊。用像素極值判定，與來源無關、最穩健。
+
+    無 PIL 或解碼失敗 → 回 False（保守：不誤刪判不出的圖）。
+    """
+    if _PILImage is None:
+        return False
+    try:
+        with _PILImage.open(io.BytesIO(img_bytes)) as im:
+            im.load()
+            # 帶 alpha 且整張全透明 → 無效
+            if "A" in im.getbands():
+                _amin, amax = im.getchannel("A").getextrema()
+                if amax == 0:
+                    return True
+            rgb = im if im.mode == "RGB" else im.convert("RGB")
+            extrema = rgb.getextrema()  # ((minR,maxR),(minG,maxG),(minB,maxB))
+            channel_max = max(hi for _lo, hi in extrema)
+            return channel_max <= threshold
+    except Exception:
+        return False
+
 
 class ImageExtractor(ABC):
     """fast 與 slow 路徑共用同一個 strategy；slow 多一個 marker_images 參數。"""
@@ -85,6 +117,11 @@ class HashNamedImageExtractor(ImageExtractor):
                 if img_hash in ctx.filter_state.banned_image_hashes:
                     continue
 
+                # W6：已判定為全黑/全透明的無效圖 → 直接 skip，不重解碼、不寫檔
+                if img_hash in ctx.filter_state.black_image_hashes:
+                    ctx.filter_state.black_image_skipped += 1
+                    continue
+
                 # 已存過 → 直接引用，不重存
                 if img_hash in ctx.saved_image_hashes:
                     name = ctx.hash_to_filename[img_hash]
@@ -102,6 +139,12 @@ class HashNamedImageExtractor(ImageExtractor):
                     ctx.filter_state.xref_to_hash_cache[xref] = None
                     continue
                 if base_img["width"] < ctx.min_image_dim or base_img["height"] < ctx.min_image_dim:
+                    continue
+
+                # W6：全黑/全透明無效圖 → 記入 black_image_hashes（cache 給後續頁）並跳過
+                if _is_all_black(base_img["image"], ctx.black_threshold):
+                    ctx.filter_state.black_image_hashes.add(img_hash)
+                    ctx.filter_state.black_image_skipped += 1
                     continue
 
                 ext = base_img["ext"]
@@ -136,6 +179,18 @@ class HashNamedImageExtractor(ImageExtractor):
             img_bytes, ext = converted
 
             img_hash = hashlib.md5(img_bytes).hexdigest()
+
+            # W6：全黑/全透明無效圖 → 移除 marker_text 內該圖引用（避免 dangling ref）並跳過
+            if (img_hash in ctx.filter_state.black_image_hashes
+                    or _is_all_black(img_bytes, ctx.black_threshold)):
+                ctx.filter_state.black_image_hashes.add(img_hash)
+                ctx.filter_state.black_image_skipped += 1
+                new_text = re.sub(
+                    r"!\[[^\]]*\]\(" + re.escape(orig_name) + r"\)",
+                    "",
+                    new_text,
+                )
+                continue
 
             # 已存過（含 fast 路徑也算過）→ 直接 reuse，不重寫檔
             if img_hash in ctx.saved_image_hashes:
