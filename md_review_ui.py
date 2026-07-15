@@ -62,7 +62,7 @@ try:
         DEFAULT_SYSTEM_PROMPT as LLM_DEFAULT_SYSTEM_PROMPT,
         RAG_SYSTEM_PROMPT as LLM_RAG_SYSTEM_PROMPT,
         COMPARE_SYSTEM_PROMPT as LLM_COMPARE_SYSTEM_PROMPT,
-        RANK_SYSTEM_PROMPT as LLM_RANK_SYSTEM_PROMPT,
+        STRUCTURED_SYSTEM_PROMPT as LLM_STRUCTURED_SYSTEM_PROMPT,
         format_chunks as llm_format_chunks,
         generate_hyde as llm_generate_hyde,
         generate_title as llm_generate_title,
@@ -76,13 +76,23 @@ except ImportError:
     LLM_DEFAULT_SYSTEM_PROMPT = ""
     LLM_RAG_SYSTEM_PROMPT = ""
     LLM_COMPARE_SYSTEM_PROMPT = ""
-    LLM_RANK_SYSTEM_PROMPT = ""
+    LLM_STRUCTURED_SYSTEM_PROMPT = ""
     llm_format_chunks = None
     llm_generate_hyde = None
     llm_generate_title = None
     llm_analyze_query = None
     QueryPlan = None
     HAS_LLM = False
+
+# 第 2 層結構化屬性表（人工維護、熱載入；downstream-only）
+try:
+    import structured_table as _structured_table
+    HAS_STRUCTURED = True
+except ImportError:
+    _structured_table = None
+    HAS_STRUCTURED = False
+# 預設路徑：專案目錄下 structured_data/建案屬性表.csv（可在 sidebar 覆寫）
+STRUCTURED_TABLE_PATH = str(Path(__file__).resolve().parent / "structured_data" / "建案屬性表.csv")
 
 # 對話紀錄「瀏覽器 localStorage」持久化（退化版：不再寫 server 磁碟，多人共用 server 時各自獨立）
 try:
@@ -1833,13 +1843,59 @@ def fanout_retrieve(
     return all_chunks
 
 
-def structured_lookup_stub(plan) -> None:
-    """第 2 層「人工結構化資料表」查詢插槽。**目前未接入 → 永遠回 None。**
+@st.cache_data(show_spinner=False)
+def _load_structured_cached(path: str, mtime: float):
+    """讀屬性表；**mtime 當快取 key** → 你在 Excel 改完存檔（mtime 跳）就自動熱載入，
+    app 不重啟。回 structured_table.TableData。"""
+    return _structured_table.load_table(path)
 
-    未來接 Excel/CSV→pandas（一列一建案、欄位＝屬性、key＝project_name）時在此實作。
-    回 None 代表「資料表未收錄」，上游據此明講、**禁止 fall through 回向量猜數字**
-    （見 rag_comparison_routing_design 定案決策）。"""
-    return None
+
+def _get_structured_table():
+    """取屬性表（熱載入 + last-good fallback）。回 (TableData|None, path, notices)。
+
+    讀檔失敗（例如你正在存檔的半途）→ 沿用 session 內上次成功載入的版本 + 掛 notice，
+    不讓 chat 因表壞掉而整個掛。"""
+    notices: list[str] = []
+    if not HAS_STRUCTURED:
+        return None, "", notices
+    path = st.session_state.get("_structured_path", STRUCTURED_TABLE_PATH)
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0.0
+    td = _load_structured_cached(path, mtime)
+    if td is not None and getattr(td, "ok", False):
+        st.session_state["_structured_last_good"] = td
+        return td, path, notices
+    # 只有「真正讀檔/格式失敗」（有 error）才用 last-good；純粹「尚未填」（空表）不觸發
+    if td is not None and getattr(td, "error", None):
+        last = st.session_state.get("_structured_last_good")
+        if last is not None:
+            notices.append(f"⚠️ 屬性表讀取異常（{td.error}），沿用上次成功載入的版本。")
+            return last, path, notices
+    return td, path, notices  # 空表或無 last-good：回 td，上游自行判斷
+
+
+def structured_lookup(plan, restrict_projects):
+    """第 2 層屬性表查詢。回 {markdown, notices, covered} 或 None。
+
+    None 代表「表未收錄此查詢相關屬性」→ 上游明講、**禁止 fall through 回向量猜數字**
+    （見 rag_comparison_routing_design 定案）。restrict_projects＝sidebar 硬約束。"""
+    if not HAS_STRUCTURED or plan is None:
+        return None
+    td, _path, load_notices = _get_structured_table()
+    if td is None or not getattr(td, "ok", False):
+        return None
+    res = _structured_table.lookup(
+        td,
+        entities=plan.entity_mentions,
+        attributes=plan.attributes,
+        restrict_projects=restrict_projects or None,
+    )
+    if res is None:
+        return None
+    notices = list(load_notices) + list(td.warnings) + list(res.notices)
+    return {"markdown": res.markdown, "notices": notices, "covered": res.covered_projects}
 
 
 def route_and_retrieve(
@@ -1854,8 +1910,8 @@ def route_and_retrieve(
 
     - plan=None（router 關閉／失敗／LLM 關閉）→ 一律單發 fact，等同現行行為。
     - compare → 每建案 fan-out（需 ≥2 個對得上的建案，否則退 fact）。
-    - rank → structured_lookup_stub（恒 None，第 2 層未接入）→ 仍做檢索當「未排序參考」，
-      並掛未接入 notice；system prompt 端禁止 LLM 自行排序。
+    - structured → 查第 2 層屬性表（權威數值來源），回 structured_md；另撈參考片段當質性補充。
+      表未收錄 → structured_md=None + 明講 notice；STRUCTURED prompt 禁止 LLM 從片段取數字排序。
     sidebar_projects 是硬約束：router 不得覆蓋（有指定就取交集 / 或直接用指定清單）。"""
     notices: list[str] = []
     intent = plan.intent if plan else "fact"
@@ -1917,20 +1973,29 @@ def route_and_retrieve(
             notices.append("未能在資料庫對應到 2 個以上的具名建案，已退回一般檢索。")
         return {"chunks": _single_shot(top_k), "intent": "fact", "grouped": False, "notices": notices}
 
-    if intent == "rank":
-        _ = structured_lookup_stub(plan)  # 恒 None：第 2 層資料表未接入
-        notices.append(
-            "⚠️ 排序／極值查詢的『結構化資料表（第 2 層）』尚未接入；以下為**未排序**參考資料，"
-            "系統不會自行排名或聚合數字。"
-        )
+    if intent == "structured":
+        # 第 2 層：屬性表撈子表（權威數值來源）。撈到 → 掛表；撈不到 → 明講未收錄、不猜。
+        sres = structured_lookup(plan, sidebar_projects)
+        structured_md = sres["markdown"] if sres else None
+        if sres:
+            notices.extend(sres["notices"])
+        else:
+            notices.append(
+                "ℹ️ 結構化屬性表未收錄此查詢相關屬性；以下為向量檢索參考片段，"
+                "系統不會據此自行排序或編造數值。"
+            )
+        # 無論表有無命中，都撈參考片段當「質性補充」（STRUCTURED prompt 禁止從中取數字排序）
         ents, rws, _unresolved = _resolve()
         if len(ents) >= 2:
             chunks = fanout_retrieve(
                 embedder, cli, coll, search_mode, ents, rws, base_must, per_entity_k,
             )
-            return {"chunks": chunks, "intent": "rank", "grouped": True, "notices": notices}
-        # 沒有可 fan-out 的建案 → 單發撈參考片段（不排序，交由 RANK prompt 約束 LLM）
-        return {"chunks": _single_shot(top_k), "intent": "rank", "grouped": False, "notices": notices}
+            grouped = True
+        else:
+            chunks = _single_shot(top_k)
+            grouped = False
+        return {"chunks": chunks, "intent": "structured", "grouped": grouped,
+                "notices": notices, "structured_md": structured_md}
 
     # fact（含所有 fallback 路徑）
     return {"chunks": _single_shot(top_k), "intent": "fact", "grouped": False, "notices": notices}
@@ -2686,10 +2751,30 @@ def _render_chat_view() -> None:
                 key="_chat_smart_route",
                 help="開＝先用 LLM 判斷意圖再分派檢索：\n"
                      "・比較題 → 對每個建案各撈一次（涵蓋率不再靠 top-k 運氣）\n"
-                     "・排序／極值題 → 明講排序資料表（第 2 層）尚未接入、不自行排名\n"
+                     "・排序／極值／篩選／查屬性題 → 查人工維護的結構化屬性表（第 2 層），數字以表為準\n"
                      "・一般題 → 現行單發檢索\n"
                      "需 LLM 開啟；LLM 關閉或路由失敗時自動退回單發。",
             )
+            # 第 2 層結構化屬性表狀態 + 熱載入（改 CSV 存檔即生效，此鈕僅供強制刷新）
+            if HAS_STRUCTURED and sb_smart_route:
+                _stpath = st.session_state.get("_structured_path", STRUCTURED_TABLE_PATH)
+                if os.path.exists(_stpath):
+                    _td = _load_structured_cached(_stpath, os.path.getmtime(_stpath))
+                    if _td is not None and _td.ok:
+                        st.caption(
+                            f"📊 屬性表：{len(_td.projects)} 建案 × {len(_td.attributes)} 屬性"
+                            f"（{len(_td.rows)} 列）"
+                        )
+                    elif _td is not None and _td.error:
+                        st.caption(f"📊 屬性表讀取異常：{_td.error}")
+                    else:
+                        st.caption("📊 屬性表：模板就緒，尚未填入資料")
+                else:
+                    st.caption(f"📊 屬性表未找到：{_stpath}")
+                if st.button("🔄 重新載入屬性表", key="_structured_reload",
+                             help="改完 CSV 存檔通常會自動生效；此鈕清快取強制刷新"):
+                    _load_structured_cached.clear()
+                    st.rerun()
             # 「指定專案」多選框不放這裡，改置於聊天室正上方的 sticky bar（見主區）
 
         # LLM 參數
@@ -2932,8 +3017,9 @@ def _render_chat_view() -> None:
 
         # 1. RAG 檢索：RAG 開啟，或 LLM 關閉（僅檢索模式必須有結果可展示）時都要跑
         rag_chunks: list[dict] = []
-        route_intent = "fact"          # 三路 router 結果：fact / compare / rank
-        route_grouped = False          # chunks 是否依建案分組（compare/rank fan-out）
+        route_intent = "fact"          # 三路 router 結果：fact / compare / structured
+        route_grouped = False          # chunks 是否依建案分組（compare/structured fan-out）
+        route_structured_md = None     # structured 路徑撈到的屬性表 markdown（權威數值來源）
         route_notices: list[str] = []  # 給使用者看的路由訊息（截斷/未對應/退回等，不靜默）
         do_retrieval = sb_rag_on or not sb_llm_on
         if do_retrieval:
@@ -2987,7 +3073,7 @@ def _render_chat_view() -> None:
             _intent = plan.intent if plan else "fact"
             _label = {
                 "compare": "逐建案比較檢索",
-                "rank": "排序題參考檢索",
+                "structured": "查結構化屬性表",
             }.get(_intent, f"檢索中（{sb_search_mode} top-{sb_top_k}）")
             try:
                 with st.spinner(f"{_label}..."):
@@ -3006,6 +3092,7 @@ def _render_chat_view() -> None:
             rag_chunks = _route["chunks"]
             route_intent = _route["intent"]
             route_grouped = _route["grouped"]
+            route_structured_md = _route.get("structured_md")
             route_notices.extend(_route["notices"])
         else:
             llm_cli = get_llm_client(sb_llm_url)
@@ -3015,8 +3102,8 @@ def _render_chat_view() -> None:
             #    rank → 明講第 2 層未接入、禁止自行排序；fact → 現行 RAG / 純對話。
             if route_intent == "compare":
                 sys_prompt = LLM_COMPARE_SYSTEM_PROMPT or LLM_RAG_SYSTEM_PROMPT
-            elif route_intent == "rank":
-                sys_prompt = LLM_RANK_SYSTEM_PROMPT or LLM_RAG_SYSTEM_PROMPT
+            elif route_intent == "structured":
+                sys_prompt = LLM_STRUCTURED_SYSTEM_PROMPT or LLM_RAG_SYSTEM_PROMPT
             elif rag_chunks:
                 sys_prompt = LLM_RAG_SYSTEM_PROMPT
             else:
@@ -3029,11 +3116,23 @@ def _render_chat_view() -> None:
             while prior and prior[-1].get("role") == "user":
                 prior = prior[:-1]
             messages.extend(prior[-10:])  # 保留近 5 輪（user+assistant）
+            ctx_blocks: list[str] = []
+            if route_structured_md:
+                ctx_blocks.append(
+                    "【結構化資料表】（權威數值來源；排序／計數／任何數字只能依這張表）\n"
+                    + route_structured_md
+                )
             if rag_chunks:
                 ctx_text = llm_format_chunks(rag_chunks, group_by_entity=route_grouped)
+                ref_label = (
+                    "【參考資料】（僅供質性補充，勿從中取數字排序）"
+                    if route_structured_md else "【參考資料】"
+                )
+                ctx_blocks.append(f"{ref_label}\n{ctx_text}")
+            if ctx_blocks:
                 messages.append({
                     "role": "user",
-                    "content": f"【參考資料】\n{ctx_text}\n\n【問題】\n{q}",
+                    "content": "\n\n".join(ctx_blocks) + f"\n\n【問題】\n{q}",
                 })
             else:
                 messages.append({"role": "user", "content": q})

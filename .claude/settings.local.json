@@ -58,7 +58,8 @@
       "Bash(grep -oE 'o=[^;]{0,200}' \"C:/project_file/RAG_PuTrue/venv312/Lib/site-packages/streamlit/static/static/js/IFrame.CWtgwiOd.js\")",
       "Bash(./venv312/Scripts/python *)",
       "Bash(ipconfig)",
-      "Bash(powershell -NoProfile -Command \"\\(Get-NetIPAddress -AddressFamily IPv4 | Select-Object -ExpandProperty IPAddress\\)\")"
+      "Bash(powershell -NoProfile -Command \"\\(Get-NetIPAddress -AddressFamily IPv4 | Select-Object -ExpandProperty IPAddress\\)\")",
+      "Bash(echo \"exit=$?\")"
     ]
   }
 }
