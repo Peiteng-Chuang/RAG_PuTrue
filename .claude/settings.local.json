@@ -59,7 +59,10 @@
       "Bash(./venv312/Scripts/python *)",
       "Bash(ipconfig)",
       "Bash(powershell -NoProfile -Command \"\\(Get-NetIPAddress -AddressFamily IPv4 | Select-Object -ExpandProperty IPAddress\\)\")",
-      "Bash(echo \"exit=$?\")"
+      "Bash(echo \"exit=$?\")",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(echo \"LAUNCH_EXIT=$? \\(124=正常逾時被砍表示伺服器持續運行\\)\")",
+      "Read(//tmp/**)"
     ]
   }
 }

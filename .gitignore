@@ -1,5 +1,6 @@
 
 *.pdf
+*.pyc
 .vscode/
 _compare_cache/
 _md_trash/
