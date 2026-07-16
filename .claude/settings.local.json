@@ -62,7 +62,9 @@
       "Bash(echo \"exit=$?\")",
       "Bash(echo \"EXIT=$?\")",
       "Bash(echo \"LAUNCH_EXIT=$? \\(124=正常逾時被砍表示伺服器持續運行\\)\")",
-      "Read(//tmp/**)"
+      "Read(//tmp/**)",
+      "Bash(xargs ls -lh)",
+      "Bash(awk '{print $2}')"
     ]
   }
 }
