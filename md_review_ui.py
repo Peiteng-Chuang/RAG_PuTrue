@@ -3897,53 +3897,97 @@ if not pages:
     st.stop()
 
 # === 頁面導覽列 ===
+# ⚠️ 遠端（有網路延遲）使用者：ace 編輯器 auto_update=True 是「失焦才回傳」，點按鈕會先觸發
+# 失焦、再觸發點擊。舊寫法用「瞬時 st.button() 回傳值 + st.rerun()」判斷換頁，延遲下按鈕的
+# 瞬時 True 會被失焦那次 rerun 吃掉 → 遠端「打字後無法換頁」（本機 0 延遲則無感）。
+# 改用 on_click / on_change callback：點擊與失焦值會在同一次 rerun 被處理，callback 保證執行。
+# callback 在 script body 之前跑 → 換頁/存檔一律「先 commit 當前頁編輯」再移動，避免編輯寫錯頁。
+def _nav_commit_current():
+    """把當前頁 ace/text_area 的最新值吸收進 current_md（callback 內先跑，確保不遺失編輯）。"""
+    fk = st.session_state.get("loaded_file")
+    if fk:
+        commit_editor_if_dirty(fk, st.session_state.page_idx)
+
+def _nav_page_count() -> int:
+    _, _, _pgs = parse_md(st.session_state.current_md)
+    return len(_pgs)
+
+def _nav_go(delta: int):
+    _nav_commit_current()
+    total = _nav_page_count()
+    st.session_state.page_idx = max(0, min(total - 1, st.session_state.page_idx + delta))
+
+def _nav_jump():
+    _nav_commit_current()
+    total = _nav_page_count()
+    target = int(st.session_state.get("nav_jump_page", 1))
+    st.session_state.page_idx = max(0, min(total - 1, target - 1))
+
+def _do_save():
+    fk = st.session_state.get("loaded_file")
+    if not fk:
+        return
+    _nav_commit_current()  # 存檔前先吸收當前頁編輯（含尚未 commit 的最後一次打字）
+    mp = derive_md_path(fk)
+    mp.write_text(st.session_state.current_md, encoding="utf-8")
+    mark_processing(fk)
+    # 儲存＝提交刪除：關閉圖片復原視窗（垃圾桶檔案自此視為永久刪除）
+    st.session_state.delete_history[fk] = []
+    # 磁碟已動：捨棄編輯無法再無痛還原 prior_status（會留在 processing）
+    sc = st.session_state.sidecars.get(fk)
+    if sc is not None:
+        sc["disk_dirty"] = True
+    persist_review_state(fk)
+    st.session_state["_review_toast"] = f"已儲存 → {mp.name}"
+
+def _do_discard():
+    fk = st.session_state.get("loaded_file")
+    if not fk:
+        return
+    # 先把軟刪除的圖檔從垃圾桶搬回原位，否則 reload 回來的 md 引用會變孤兒
+    restore_trashed_files_for(fk)
+    st.session_state.current_md = derive_md_path(fk).read_text(encoding="utf-8")
+    st.session_state.delete_history[fk] = []
+    # 還原：若進入 processing 前是 encoded/ingested 且磁碟未被儲存，回去原狀態
+    sc = st.session_state.sidecars.get(fk)
+    if sc is not None:
+        prior = sc.get("prior_status")
+        dirty = sc.get("disk_dirty", False)
+        if prior and not dirty:
+            sc["review_status"] = prior
+            sc.pop("prior_status", None)
+            sc.pop("disk_dirty", None)
+    persist_review_state(fk)
+    # bump 版本：換 editor key → 丟棄未 commit 的編輯（頂層 commit 會撈不到舊 key 而 no-op）
+    bump_widget_version()
+
+# 跳頁輸入框的顯示值跟著 page_idx 走（widget 建立前設定 session_state 是允許的；勿再傳 value=）
+st.session_state.nav_jump_page = st.session_state.page_idx + 1
+
 nav_cols = st.columns([1, 1, 2, 1, 1])
 with nav_cols[0]:
-    if st.button("⟵ 上一頁", use_container_width=True) and st.session_state.page_idx > 0:
-        st.session_state.page_idx -= 1
-        st.rerun()
+    st.button("⟵ 上一頁", use_container_width=True,
+              disabled=st.session_state.page_idx <= 0,
+              on_click=_nav_go, args=(-1,))
 with nav_cols[1]:
-    if st.button("下一頁 ⟶", use_container_width=True) and st.session_state.page_idx < len(pages) - 1:
-        st.session_state.page_idx += 1
-        st.rerun()
+    st.button("下一頁 ⟶", use_container_width=True,
+              disabled=st.session_state.page_idx >= len(pages) - 1,
+              on_click=_nav_go, args=(1,))
 with nav_cols[2]:
-    target = st.number_input(
+    st.number_input(
         "跳到頁碼", min_value=1, max_value=len(pages),
-        value=st.session_state.page_idx + 1, label_visibility="collapsed",
+        key="nav_jump_page", label_visibility="collapsed",
+        on_change=_nav_jump,
     )
-    if target - 1 != st.session_state.page_idx:
-        st.session_state.page_idx = target - 1
-        st.rerun()
 with nav_cols[3]:
-    if st.button("儲存 .md", type="primary", use_container_width=True):
-        md_path.write_text(st.session_state.current_md, encoding="utf-8")
-        mark_processing(selected_key)
-        # 儲存＝提交刪除：關閉圖片復原視窗（垃圾桶檔案自此視為永久刪除）
-        st.session_state.delete_history[selected_key] = []
-        # 磁碟已動：捨棄編輯無法再無痛還原 prior_status（會留在 processing）
-        sc = st.session_state.sidecars.get(selected_key)
-        if sc is not None:
-            sc["disk_dirty"] = True
-        persist_review_state(selected_key)
-        st.success(f"已儲存 → {md_path.name}")
+    st.button("儲存 .md", type="primary", use_container_width=True, on_click=_do_save)
 with nav_cols[4]:
-    if st.button("捨棄編輯", use_container_width=True):
-        # 先把軟刪除的圖檔從垃圾桶搬回原位，否則 reload 回來的 md 引用會變孤兒
-        restore_trashed_files_for(selected_key)
-        st.session_state.current_md = md_path.read_text(encoding="utf-8")
-        st.session_state.delete_history[selected_key] = []
-        # 還原：若進入 processing 前是 encoded/ingested 且磁碟未被儲存，回去原狀態
-        sc = st.session_state.sidecars.get(selected_key)
-        if sc is not None:
-            prior = sc.get("prior_status")
-            dirty = sc.get("disk_dirty", False)
-            if prior and not dirty:
-                sc["review_status"] = prior
-                sc.pop("prior_status", None)
-                sc.pop("disk_dirty", None)
-        persist_review_state(selected_key)
-        bump_widget_version()
-        st.rerun()
+    st.button("捨棄編輯", use_container_width=True, on_click=_do_discard)
+
+# 存檔成功訊息（callback 內無法直接 st.success，改用 session flag 於 render 時顯示）
+_toast = st.session_state.pop("_review_toast", None)
+if _toast:
+    st.success(_toast)
 
 current_idx = st.session_state.page_idx
 page_num, page_md = pages[current_idx]
@@ -4204,6 +4248,11 @@ with tab_meta:
         for s in sections if s["image_paths"]
     ]
 
+    # callback（doc_type / 加入標籤）設定的訊息，於 render 時顯示（callback 內無法直接 st.success）
+    _mt = st.session_state.pop("_meta_toast", None)
+    if _mt:
+        (st.success if _mt[0] == "ok" else st.warning)(_mt[1])
+
     # === 區塊 0：文件種類（doc_type）—— 資料夾層級，套用到同資料夾所有檔案 ===
     st.markdown("### 文件種類（doc_type）")
     _dt_parts = split_key_parts(selected_key)
@@ -4226,18 +4275,26 @@ with tab_meta:
                 label_visibility="collapsed",
             )
         with _dt_cols[1]:
-            if st.button("套用到此資料夾", use_container_width=True, key="_doctype_apply"):
-                _dt_clean = _dt_new.strip()
-                if _dt_clean:
-                    _dt_map[_dt_folder] = _dt_clean
+            # 遠端修法：on_click callback + 從 session_state 讀輸入值（非 widget 回傳值），
+            # 避免延遲下「點擊被失焦吞掉」或「誤讀空值 → 意外清掉整個資料夾的 doc_type 對照」。
+            def _apply_doctype(folder: str, input_key: str):
+                val = str(st.session_state.get(input_key, "")).strip()
+                m = load_doc_type_map()
+                if val:
+                    m[folder] = val
                 else:
-                    _dt_map.pop(_dt_folder, None)  # 清空＝移除對照，退回未分類
-                save_doc_type_map(_dt_map)
-                st.success(
-                    f"已設定 `{_dt_folder}` → {_dt_clean or DOC_TYPE_DEFAULT}"
-                    "（只改對照表、不動向量；舊資料需重新 encode/ingest 才帶上新值）"
+                    m.pop(folder, None)  # 清空＝移除對照，退回未分類
+                save_doc_type_map(m)
+                st.session_state["_meta_toast"] = (
+                    "ok",
+                    f"已設定 `{folder}` → {val or DOC_TYPE_DEFAULT}"
+                    "（只改對照表、不動向量；舊資料需重新 encode/ingest 才帶上新值）",
                 )
-                st.rerun()
+            st.button(
+                "套用到此資料夾", use_container_width=True, key="_doctype_apply",
+                on_click=_apply_doctype,
+                args=(_dt_folder, f"_doctype_input_{_dt_folder}"),
+            )
     else:
         st.caption("此檔不在子資料夾內（file_key 無上層資料夾）→ doc_type 為「未分類」。")
     st.divider()
@@ -4306,23 +4363,37 @@ with tab_meta:
         nk_key = f"new_lbl_k_{selected_key}_{current_idx}_v{st.session_state.widget_version}"
         nv_key = f"new_lbl_v_{selected_key}_{current_idx}_v{st.session_state.widget_version}"
         ns_key = f"new_lbl_s_{selected_key}_{current_idx}_v{st.session_state.widget_version}"
-        new_key_val = st.text_input("標籤名 (key)", key=nk_key, placeholder="例：context")
-        new_val_val = st.text_area("內容 (value)", key=nv_key, height=80,
-                                    placeholder="例：璞真建設股份有限公司台北...")
-        new_scope = st.radio("適用範圍", ["🟢 整份文件", "🟡 僅當頁"],
-                             horizontal=True, key=ns_key)
-        if st.button("加入標籤", type="primary"):
-            if not new_key_val.strip() or not new_val_val.strip():
-                st.warning("標籤名與內容皆不可空白")
+        st.text_input("標籤名 (key)", key=nk_key, placeholder="例：context")
+        st.text_area("內容 (value)", key=nv_key, height=80,
+                     placeholder="例：璞真建設股份有限公司台北...")
+        st.radio("適用範圍", ["🟢 整份文件", "🟡 僅當頁"],
+                 horizontal=True, key=ns_key)
+
+        # 遠端修法：on_click callback + 從 session_state 讀值。避免延遲下「打了字卻誤判空白」，
+        # 且點擊不會被 text_area 失焦那次 rerun 吞掉。
+        def _add_label(k_key: str, v_key: str, s_key: str):
+            k = str(st.session_state.get(k_key, "")).strip()
+            v = str(st.session_state.get(v_key, "")).strip()
+            scope = st.session_state.get(s_key, "🟢 整份文件")
+            if not k or not v:
+                st.session_state["_meta_toast"] = ("warn", "標籤名與內容皆不可空白")
+                return
+            fk = st.session_state.get("loaded_file")
+            idx = st.session_state.page_idx
+            file_lbls = st.session_state.custom_labels.setdefault(
+                fk, {"document": [], "pages": {}}
+            )
+            entry = {"key": k, "value": v}
+            if str(scope).startswith("🟢"):
+                file_lbls["document"].append(entry)
             else:
-                entry = {"key": new_key_val.strip(), "value": new_val_val.strip()}
-                if new_scope.startswith("🟢"):
-                    doc_labels.append(entry)
-                else:
-                    page_labels.append(entry)
-                mark_processing(selected_key)
-                bump_widget_version()
-                st.rerun()
+                file_lbls["pages"].setdefault(idx, []).append(entry)
+            mark_processing(fk)
+            bump_widget_version()  # 換 key → 清空輸入框
+            st.session_state["_meta_toast"] = ("ok", f"已加入標籤 `{k}`")
+
+        st.button("加入標籤", type="primary",
+                  on_click=_add_label, args=(nk_key, nv_key, ns_key))
 
     st.divider()
 
