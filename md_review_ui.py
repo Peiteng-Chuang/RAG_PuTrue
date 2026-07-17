@@ -3938,6 +3938,9 @@ def _do_save():
     if sc is not None:
         sc["disk_dirty"] = True
     persist_review_state(fk)
+    # 換 editor key → 強制 ace 重新掛載（同換頁/捨棄）。避免 auto_update=True 在同一個未重掛的
+    # ace 上反覆回傳值，與頂層 commit_editor_if_dirty 比對形成 rerun 迴圈（遠端表現為存檔後卡住）。
+    bump_widget_version()
     st.session_state["_review_toast"] = f"已儲存 → {mp.name}"
 
 def _do_discard():
