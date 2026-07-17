@@ -3938,9 +3938,6 @@ def _do_save():
     if sc is not None:
         sc["disk_dirty"] = True
     persist_review_state(fk)
-    # 換 editor key → 強制 ace 重新掛載（同換頁/捨棄）。避免 auto_update=True 在同一個未重掛的
-    # ace 上反覆回傳值，與頂層 commit_editor_if_dirty 比對形成 rerun 迴圈（遠端表現為存檔後卡住）。
-    bump_widget_version()
     st.session_state["_review_toast"] = f"已儲存 → {mp.name}"
 
 def _do_discard():
@@ -4117,32 +4114,19 @@ with tab_pdf:
         )
         editor_body = strip_page_header(page_md)
         editor_key = editor_key_for(selected_key, current_idx, st.session_state.widget_version)
-        if HAS_ACE:
-            st_ace(
-                value=editor_body,
-                language="markdown",
-                theme="chrome",
-                keybinding="vscode",      # Alt+↑/↓ 移行、Ctrl+Alt+↑/↓ 多游標等整套
-                font_size=14,
-                tab_size=2,
-                show_gutter=True,
-                wrap=True,
-                auto_update=True,          # 失焦立刻回 value，commit_editor_if_dirty 下次 rerun 撈
-                min_lines=30,
-                key=editor_key,
-            )
-        else:
-            st.warning(
-                "未安裝 `streamlit-ace`，暫用基本編輯器（無 Alt+↑↓ / 多游標）。"
-                "安裝後可獲 VSCode 級編輯：`pip install streamlit-ace`"
-            )
-            st.text_area(
-                "Page Markdown",
-                value=editor_body,
-                height=600,
-                key=editor_key,
-                label_visibility="collapsed",
-            )
+        # 用原生 st.text_area 取代 st_ace（2026-07：遠端「存檔後畫面一直轉圈」根治）。
+        # 原因：st_ace(auto_update=True) 會在內容變動後排程送出值，存檔使 value 變動 → 反覆
+        # 送出 → rerun 迴圈（LAN 無代理仍會，因為是 server 端 churn）。而 auto_update=False
+        # 需手動按 Apply 才提交、打完字直接換頁/存檔會漏存。原生 text_area 失焦即自動寫入
+        # session_state、零迴圈、使用者無需多按鍵，commit_editor_if_dirty 行為不變。
+        # 代價：失去 ace 的語法高亮 / Alt+↑↓ 移行 / 多游標 / VSCode 快鍵。
+        st.text_area(
+            "Page Markdown",
+            value=editor_body,
+            height=600,
+            key=editor_key,
+            label_visibility="collapsed",
+        )
 
 # --- 分頁 2：圖片校對 ---
 with tab_img:
