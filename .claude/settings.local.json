@@ -64,7 +64,9 @@
       "Bash(echo \"LAUNCH_EXIT=$? \\(124=正常逾時被砍表示伺服器持續運行\\)\")",
       "Read(//tmp/**)",
       "Bash(xargs ls -lh)",
-      "Bash(awk '{print $2}')"
+      "Bash(awk '{print $2}')",
+      "Bash(iconv -f utf-8 -t utf-8)",
+      "Bash(curl -s -m 4 http://localhost:6333/collections)"
     ]
   }
 }

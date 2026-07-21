@@ -37,6 +37,14 @@ from starlette.routing import Route
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("dify_retrieval")
 
+# 讀 .env（與 md_review_ui / LLM_fill_sheet 一致）→ DIFY_API_KEY 等可寫在 .env，
+# 不必每次在 shell `set`。shell 已設的環境變數優先（load_dotenv 預設不覆寫）。
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # ---- 設定（環境變數，全有預設）----
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY", "")
