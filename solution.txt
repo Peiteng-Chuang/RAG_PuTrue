@@ -1,0 +1,215 @@
+============================================================
+ Dify 整合可行性分析與解法
+ 本專案 Qdrant schema  vs  Dify 的 Qdrant / 知識庫模型
+============================================================
+日期：2026-06-23
+依據：qdrant格式.md v2（本專案 single source of truth）
+      + Dify 官方文件（External Knowledge API / Qdrant 整合）
+
+────────────────────────────────────────────────────────────
+0. 一句話結論
+────────────────────────────────────────────────────────────
+直接讓兩邊資料庫互通「不可行也不該做」。
+正確的相容路徑是 Dify 的「外部知識庫 API」（External Knowledge API）：
+你的 Qdrant payload 一個欄位都不用拔，Dify 只透過 POST /retrieval
+拿你算好的 hybrid 檢索結果。
+
+可行性判定：
+  方案 A 把我的 point 直接塞進 Dify 的 Qdrant collection ……… 不可行（Dify 認不得）
+  方案 B 把我的 Markdown 丟進 Dify 知識庫讓它重做 ……………… 能跑但浪費（前處理歸零）
+  方案 C External Knowledge API（POST /retrieval）………………… 高度可行（推薦）
+
+
+────────────────────────────────────────────────────────────
+1. 欄位對照表
+────────────────────────────────────────────────────────────
+本專案 putrue_rag_text_v1            vs   Dify 的 Qdrant 寫法
+
+語意            | 本專案 Qdrant                                  | Dify Qdrant payload
+----------------|------------------------------------------------|------------------------------------
+正文            | content.text / text_with_prefix / md_content   | page_content（單一字串）
+                | （三份分工）                                   |
+主鍵 / 回查鍵   | metadata.source.file_hash, file_key            | metadata.doc_id, doc_hash,
+                |                                                | document_id, dataset_id
+來源資訊        | metadata.source.{project_name, file_path,      | 不存 payload，存在
+                | doc_title...}                                  | PostgreSQL documents 表
+頁碼 / 標題階層 | location.{page, headings_flat, breadcrumb,     | 無對應概念；metadata 只是
+                | current_header}                                | 扁平自訂 dict
+向量            | text_dense(1024,COSINE) + text_sparse          | 單一 dense vector（維度＝Dify
+                | （named vectors，server-side RRF）             | 後台設定的 embedding 模型）
+圖片 / 多模態   | 第二 collection putrue_rag_images_v1           | 無多模態 collection 概念
+                | + linked_text_chunk_ids join                   |
+Point ID        | uuid5(file_hash|page|section_idx|chunk_idx)    | Dify 自己的 segment UUID，綁
+                | （deterministic）                              | PG document_segments.index_node_id
+狀態            | sys_info.review_status（四態，存 payload）     | 存 PG documents.indexing_status
+
+
+────────────────────────────────────────────────────────────
+2. 為何不相容（不只是欄位差異，是四個架構層級）
+────────────────────────────────────────────────────────────
+(1) 真相來源相反
+    你把「真相」放在 Qdrant payload（自包含，一個 point 帶齊
+    source/location/visuals）。Dify 把「真相」放在 PostgreSQL
+    （datasets / documents / document_segments 三張表），Qdrant
+    只是它的私有 index。Dify 檢索回一個 point 後，靠 metadata.doc_id
+    回 PG 撈正文與權限——你的 point 沒有這些鍵，Dify 即使讀到也解析不出來。
+
+(2) Embedding 綁定
+    Dify 用它後台設定的 embedding 模型「重新 embed」。你預算好的
+    bge-m3（1024 dense + learned sparse）它不會拿來用；維度 / 距離 /
+    向量名稱也對不上。
+
+(3) Hybrid 機制不同
+    你用 Qdrant named vectors（text_dense + text_sparse）做 server-side
+    RRF fusion。Dify 的 dense 向量是它自己的命名與 sparse 格式，名稱
+    對不齊，Qdrant 端無法混用。
+
+(4) Collection 生命週期 Dify 全包
+    Collection 名、建立、payload index、point id、PG 雙寫，全由 Dify
+    掌控。它不會接管一個外部程式預先寫好的 collection。
+
+→ 一句話：Dify 的 Qdrant 是「Dify 私有 index」，外部寫進去的 point
+  既不被它的向量檢索採用、也映射不回它的 dataset/document/segment 模型。
+
+
+────────────────────────────────────────────────────────────
+3. 不相容欄位分三類
+────────────────────────────────────────────────────────────
+Class A — 結構性衝突（要長成 Dify 形狀就「非改不可」）
+  你方                                      Dify              衝突本質
+  Named vectors text_dense + text_sparse  → 單一 dense vector  Dify 不吃你的 named
+                                                               vector，sparse 半段無處可放
+  point_id = uuid5(...)                   → Dify 自生 UUID     ID 規則不同，
+                                                               deterministic 覆蓋失效
+  （無）                                  → doc_id, doc_hash,  反方向缺口：Dify 靠這些
+                                            document_id,       回查 PG，你 payload 沒有
+                                            dataset_id
+
+Class B — 你方專屬、Dify 原生 payload 不帶（要「拔掉」才像 Dify 極簡 schema）
+  metadata.source.*、metadata.location.*、visuals.*、labels.*、
+  chunking.*、sys_info.*、content.text_with_prefix、content.md_content
+  （Dify metadata 雖是自由 dict，但預設不索引、不顯示這層結構）
+
+
+────────────────────────────────────────────────────────────
+4. 逐欄拔除影響（下游依賴稽核）
+────────────────────────────────────────────────────────────
+按 qdrant格式.md §2.2 / §2.5 / §5 標明的依賴關係。
+嚴重度：🔴 致命  🟠 高  🟡 中
+
+拔掉的欄位                          | 誰依賴它（出處）                       | 拔掉後果                                          | 嚴重度
+------------------------------------|----------------------------------------|---------------------------------------------------|------
+text_sparse（sparse 向量）          | hybrid 檢索的 sparse 半                | 退化成純 dense，中文術語/地號/編號/精確詞命中率掉 | 🔴
+content.text_with_prefix            | §2.5 dense embedding 的輸入            | prefix 注入消失，dense 命中率下降                 | 🔴
+content.md_content                  | §2.5 給 UI 顯示                        | 檢索結果無法還原 markdown 排版                    | 🟡
+source.file_hash                    | §2.2 index + §5 重 ingest + 圖文 join  | 無法偵測重複 ingest、images 無法 join、無法覆蓋重embed | 🔴
+source.file_key                     | §2.2 回 review UI 的錨點               | 檢索結果跳不回 md_review_ui，來源追溯斷裂         | 🔴
+source.project_name                 | §2.2 index 篩建案                      | 無法按建案過濾檢索                                | 🟡
+source.file_path / doc_title        | 引用顯示出處                           | 答案無法標出處                                    | 🟡
+location.page                       | §2.2 index + 跨頁擴張 + citation       | 失去頁級 citation（結構化還原錨點）               | 🔴
+location.headings_flat / breadcrumb | §2.2 index + chunk breadcrumb + prefix | 失去標題階層篩選與導航；breadcrumb chunking 失效  | 🔴
+  / headings                        |                                        |                                                   |
+location.section_idx / chunk_idx*   | §2.3 point_id 組成 + 鄰接定位          | point_id 無法 deterministic 生成                  | 🟠
+visuals.*（含 linked_text_chunk_ids）| ETL 多模態強關聯 + images collection   | 圖文關聯全斷，第二 collection 失去意義            | 🔴
+labels.* / label_keys               | §2.2 index 自訂標籤篩選                | label filter 失效                                 | 🟡
+chunking.strategy                   | §2.2 + §5 舊 chunk 標 stale            | 無法做 chunk 版本遷移                             | 🟠
+chunking.prev/next_chunk_id         | §2.5 parent-doc retrieval / 鄰近塊擴張 | 失去鄰塊擴張能力                                  | 🟠
+  / parent_section_id               |                                        |                                                   |
+sys_info.review_status              | §2.2 index 只 ingest approved + 四態   | 失去 review gate，可能 ingest 未審內容            | 🔴
+sys_info.embedding_model / version  | §5 重 ingest 判斷                      | 無法判斷哪些 point 需重 embed，版本遷移瞎掉       | 🟠
+  / pipeline_version                |                                        |                                                   |
+sys_info.ingestion_time / reviewer  | 稽核軌跡                               | 失去審查溯源                                      | 🟡
+  / reviewed_at                     |                                        |                                                   |
+
+小結：🔴 致命的有 8 項，全部集中在專案三大價值上——
+  - 來源追溯：file_key / file_hash / page
+  - 結構化還原：page / headings / citation
+  - 多模態強關聯：visuals
+  - hybrid 檢索：text_sparse / text_with_prefix
+  - 品質閘門：review_status
+要拔到符合 Dify 極簡 payload，等於把專案核心競爭力全砍掉。
+
+
+────────────────────────────────────────────────────────────
+5. 最關鍵：拔了還是不通
+────────────────────────────────────────────────────────────
+就算拔到只剩 page_content + 單一 dense vector，Dify 依然無法直接接管：
+  (1) Dify 會用它自己的 embedding 模型重 embed，不採用你留下的 dense vector；
+  (2) 沒有 doc_id / dataset_id，Dify 回查不了 PostgreSQL，組不出 segment；
+  (3) collection 名稱與生命週期是 Dify 開的，它不接管外部既存 collection。
+
+→ 「為適應 Dify 拔欄位」是純損失操作：自家系統被毀，Dify 互通卻一樣換不到。
+
+
+────────────────────────────────────────────────────────────
+6. 解法：External Knowledge API（推薦，一個欄位都不用拔）
+────────────────────────────────────────────────────────────
+你保留自己的 Qdrant + bge-m3 + 檢索邏輯，只寫一支 POST <endpoint>/retrieval。
+Dify 完全不碰你的資料庫，純當「對話前端 + workflow 編排」。
+
+【Request（Dify → 你）】
+{
+  "knowledge_id": "...",
+  "query": "...",
+  "retrieval_setting": { "top_k": 3, "score_threshold": 0.5 }
+}
+
+【Response（你 → Dify）】
+{
+  "records": [
+    {
+      "content": "<chunk 正文>",
+      "score": 0.98,
+      "title": "<檔名或 doc_title>",
+      "metadata": { }
+    }
+  ]
+}
+無結果時回 { "records": [] }
+
+【你現有 chunk → Dify record 對映】
+  content   ← content.md_content（或 text_with_prefix，UI 顯示帶 breadcrumb 更佳）
+  score     ← 你 Qdrant hybrid 的分數
+  title     ← source.doc_title 或 file_name
+  metadata  ← 把你的 source / location / visuals 整包塞進去做來源追溯
+              （原封不動全保留，這是反而把專屬欄位「加值」進 Dify 的做法）
+
+【會踩雷的兩個點】
+  - metadata 必須是 object，不能是 null（否則 Dify retrieval pipeline 報錯）
+  - 每筆 record 的 content 與 score 必填
+
+【設定步驟】
+  - 在 Dify 註冊 External Knowledge API：填 API Endpoint 基底 URL
+    （Dify 會自動補 /retrieval）+ API Key（Bearer 驗證）
+  - Top K（每次檢索回傳塊數，預設 3）、Score Threshold（相似度門檻，預設 0.5）
+    可在 Dify 端設定
+
+【實作建議】
+  - 用 FastAPI 寫一支端點，內部直接呼叫現有 bge-m3 hybrid 檢索
+  - 工作量約 50–100 行
+  - 前處理 / 來源追溯 / hybrid 全保留
+
+
+────────────────────────────────────────────────────────────
+7. 範圍與 commit 紀律（重要）
+────────────────────────────────────────────────────────────
+撰寫 /retrieval 端點屬於「檢索」範圍，會動到 ETL/檢索程式。
+依專案紀律：md_review_ui（下游標記工具）與 mkd_generator / 檢索（上游）
+絕對不可同 session 同時變動。此端點要單獨開一段做 + 獨立 commit，
+不跟 md_review_ui 混。
+
+
+────────────────────────────────────────────────────────────
+8. 參考來源
+────────────────────────────────────────────────────────────
+- Connect to External Knowledge Base — Dify Docs
+  https://docs.dify.ai/en/use-dify/knowledge/connect-external-knowledge-base
+- External Knowledge API — Dify (legacy docs)
+  https://legacy-docs.dify.ai/guides/knowledge-base/external-knowledge-api-documentation
+- External Knowledge API — Dify Docs
+  https://docs.dify.ai/en/use-dify/knowledge/external-knowledge-api
+- Dify x Qdrant — Dify Blog
+  https://dify.ai/blog/dify-x-qdrant-building-and-powering-the-next-gen-ai-applications
+- Knowledge Retrieval external knowledge api response metadata — Issue #11422
+  https://github.com/langgenius/dify/issues/11422
+- 本專案 qdrant格式.md v2（§2.2 payload index / §2.5 欄位語意 / §5 重 ingest 條件）

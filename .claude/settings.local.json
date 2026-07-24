@@ -66,7 +66,14 @@
       "Bash(xargs ls -lh)",
       "Bash(awk '{print $2}')",
       "Bash(iconv -f utf-8 -t utf-8)",
-      "Bash(curl -s -m 4 http://localhost:6333/collections)"
+      "Bash(curl -s -m 4 http://localhost:6333/collections)",
+      "Bash(netstat -ano)",
+      "Bash(curl -s -m 5 http://localhost:8100/health)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" -m 5 http://localhost:8100/)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" -m 5 http://localhost:8100/retrieval)",
+      "Bash(curl -s -m 20 -X POST http://localhost:8100/retrieval -H \"Authorization: Bearer putrue-rag-2026\" -H \"Content-Type: application/json\" -d '{\"knowledge_id\":\"putrue\",\"query\":\"測試\",\"retrieval_setting\":{\"top_k\":3,\"score_threshold\":0}}')",
+      "WebFetch(domain:docs.dify.ai)",
+      "Bash(curl -s -m4 http://localhost:6333/collections)"
     ]
   }
 }
