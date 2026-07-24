@@ -113,6 +113,43 @@ def search(client, qm, dense, sparse, project: str, top_k: int, prefetch_k: int 
     return res.points
 
 
+def resolve_project_names(client, qm, csv_keys: list[str]) -> tuple[dict, list]:
+    """把 CSV 純建案名對映到 Qdrant 實際的 project_name（常帶建案代號前綴，如 'B65文林中正'）。
+    Qdrant 過濾用完全相等，故必須用「全名」才 match。回 (mapping: csv_key→qdrant_name|None, 全名清單)。"""
+    qnames: list[str] = []
+    try:
+        r = client.facet(collection_name=QDRANT_COLLECTION, key=PROJECT_KEY_PATH, limit=1000)
+        qnames = [h.value for h in r.hits if isinstance(h.value, str) and h.value]
+    except Exception:  # noqa: BLE001 — facet 不可用（欄位未建 keyword 索引）→ scroll 兜底
+        seen, offset = set(), None
+        for _ in range(30):
+            pts, offset = client.scroll(QDRANT_COLLECTION, limit=1000, with_payload=True, offset=offset)
+            for p in pts:
+                v = ((p.payload or {}).get("metadata", {}) or {}).get("source", {}).get("project_name")
+                if isinstance(v, str) and v:
+                    seen.add(v)
+            if offset is None:
+                break
+        qnames = sorted(seen)
+    mapping: dict = {}
+    for k in csv_keys:
+        kk = k.strip()
+        if not kk:
+            mapping[k] = None
+        elif kk in qnames:                      # 完全相同
+            mapping[k] = kk
+        else:
+            cands = [n for n in qnames if kk in n]     # Qdrant 全名「包含」CSV 純名
+            if len(cands) == 1:
+                mapping[k] = cands[0]
+            elif len(cands) > 1:                       # 多個候選 → 取唯一 endswith，否則視為不明確
+                ends = [n for n in cands if n.endswith(kk)]
+                mapping[k] = ends[0] if len(ends) == 1 else None
+            else:
+                mapping[k] = None
+    return mapping, qnames
+
+
 def point_text_and_src(point) -> tuple[str, str, str, float]:
     """回 (content, 來源檔, 來源頁, score)。對映同 dify_retrieval_api.hit_to_record。"""
     payload = getattr(point, "payload", None) or {}
@@ -259,6 +296,19 @@ def main() -> int:
     print("[embed] 載入 bge-m3 …（CPU 約 15-60s）")
     embed = load_model()
 
+    # 建案名對映：CSV 純名 → Qdrant 實際 project_name（常帶代號前綴，如 B65文林中正）。
+    # Qdrant 過濾用完全相等，對不上就 0 筆 → 全格「無相關片段」。
+    csv_projects = [row[key_idx].strip() for row in body
+                    if row[key_idx].strip() and (not only_projects or row[key_idx].strip() in only_projects)]
+    proj_map, qnames = resolve_project_names(client, qm, csv_projects)
+    print("[建案對映] CSV 建案key → Qdrant project_name：")
+    for k in csv_projects:
+        print(f"    {k!r} → {proj_map.get(k)!r}")
+    _unresolved = [k for k in csv_projects if not proj_map.get(k)]
+    if _unresolved:
+        print(f"    ⚠️ 對不到 Qdrant 的建案（將整案跳過、不查）：{_unresolved}")
+        print(f"       Qdrant 現有 project_name（前 15）：{qnames[:15]}")
+
     audit: list[dict] = []
     filled = skipped = notfound = low_conf = 0
     processed = 0
@@ -267,6 +317,9 @@ def main() -> int:
         project = row[key_idx].strip()
         if not project or (only_projects and project not in only_projects):
             continue
+        qproject = proj_map.get(project)   # Qdrant 過濾用的全名（帶前綴）
+        if not qproject:
+            continue                        # 對不到 Qdrant 建案 → 整案跳過（上面已警告）
         for ci, attr in attr_cols:
             if only_attrs and attr not in only_attrs:
                 continue
@@ -280,7 +333,7 @@ def main() -> int:
             q = attr_to_query(project, attr)
             try:
                 dense, sparse = encode_query(embed, q)
-                pts = search(client, qm, dense, sparse, project, args.top_k)
+                pts = search(client, qm, dense, sparse, qproject, args.top_k)
             except Exception as e:  # noqa: BLE001
                 print(f"  ⚠️ [{project} / {attr}] 檢索失敗：{type(e).__name__}: {e}")
                 continue
